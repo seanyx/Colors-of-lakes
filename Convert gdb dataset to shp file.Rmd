@@ -1,0 +1,37 @@
+---
+title: "Convert gdb dataset to shp file"
+author: "Xiao Yang"
+date: "12/6/2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+require(sf)
+require(tidyverse)
+```
+
+```{r}
+layers = st_layers(dsn = "data/For_Xiao_Circa2015_Lake_Sample/Circa2015_Lakes_Sample.gdb")
+
+dat_10per_sample = st_read("data/For_Xiao_Circa2015_Lake_Sample/Circa2015_Lakes_Sample.gdb", layer = "Lakes2015_01km2_natural_others_10p_sample")
+dat_grand = st_read("data/For_Xiao_Circa2015_Lake_Sample/Circa2015_Lakes_Sample.gdb", layer = "GRanD_reservoirs_v13")
+dat_largest200 = st_read("data/For_Xiao_Circa2015_Lake_Sample/Circa2015_Lakes_Sample.gdb", layer = "Lakes2015_01km2_natural_Largest200")
+
+dat = dat_10per_sample %>% 
+  select(Class) %>% 
+  mutate(source = "dat_10per_sample") %>% 
+  rbind(dat_grand %>% 
+          select() %>% 
+          mutate(Class = NA,
+                 source = "dat_grand")) %>% 
+  rbind(dat_largest200 %>% 
+          select(Class) %>% 
+          mutate(source = "dat_largest200")) %>% 
+  rename(class = Class)
+
+st_write(dat, dsn = "outputs/lake_samples_12062019.shp")
+
+```
+
