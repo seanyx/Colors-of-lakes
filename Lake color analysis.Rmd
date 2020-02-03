@@ -31,6 +31,8 @@ calc_hue_color_bar = function(n = 100) {
   return(tibble(hue = seq(0, 1, length = n)) %>% mutate(rgb_color = hsv(h = hue, s = 1, v = 1)))
 }
 
+## import the dataset
+
 fileinfo = tibble(
   filedir = c(
     "data/lake_color_00eb0576bf0b787389229e8cdae0501b_roi1.csv",
@@ -101,7 +103,8 @@ dat = dat %>%
          value <= 0.1)
 
 hue_density = dat %>% 
-  group_by(region) %>% 
+  mutate(month = factor(month(date), levels = 1:12, labels = month.abb)) %>% 
+  group_by(region, month) %>% 
   do({
     calc_hue_density(.$hue)
   }) %>% 
@@ -122,12 +125,12 @@ all_lake_color = hue_density %>%
     axis.text = element_blank(),
     axis.ticks = element_blank()
   ) +
-  facet_wrap(~region, ncol = 1)
+  facet_grid(month~region)
 
 all_lake_color
 
 all_lake_color %>% 
-  ggsave(filename = "figures/all_lake_color_three_regions.png",
+  ggsave(filename = "figures/all_lake_color_three_regions_monthly.png",
          width = 6,
          height = 7,
          dpi = 300)
@@ -228,37 +231,43 @@ mapview::mapview(color_mode_sf, zcol = "hue_mode", color = hsv(h = seq(0.1311, 0
 require(lubridate)
 
 doy_hue = dat %>% 
+  # filter(saturation >= 0.3,
+  #        value <= 0.1) %>% 
   mutate(doy = yday(date)) %>% 
   group_by(lake_id, doy) %>% 
   summarise(mean_hue = mean(hue),
+            mean_sat = mean(saturation),
             region = first(region)) %>% 
   ungroup()
 
 lake_color_seasonality = doy_hue %>% 
-  mutate(plotcolor = hsv(h = mean_hue, s = 1, v = 1)) %>% 
+  mutate(plotcolor = hsv(h = mean_hue, s = mean_sat, v = 0.7)) %>% 
   ggplot() +
-  geom_point(aes(x = doy, y = mean_hue, group = lake_id, color = plotcolor), alpha = 0.3, size = 0.05) +
-  labs(x = "Day of the year") +
+  geom_point(aes(x = doy, y = mean_hue, group = lake_id, color = plotcolor), alpha = 0.7, size = 0.05) +
+  labs(x = "Day of the year",
+       y = "Hue") +
   ylim(0, 0.75) +
   scale_color_identity() +
   facet_wrap(~region) +
   theme(
-    panel.background = element_rect(color = "black", fill = "black"),
-    panel.grid = element_blank(),
-    axis.title.y = element_blank(),
-    axis.text.y = element_blank(),
-    axis.ticks.y = element_blank()
+    # panel.background = element_rect(color = "black", fill = "black"),
+    # panel.grid = element_blank(),
+    # axis.title.y = element_blank(),
+    # axis.text.y = element_blank(),
+    # axis.ticks.y = element_blank()
   )
 
 lake_color_seasonality
 
 lake_color_seasonality %>% 
   ggsave(
-    filename = "figures/lake_color_seasonality.png",
+    filename = "figures/lake_color_seasonality_filtered.png",
     width = 7,
     height = 3,
     dpi = 300
   )
+
+## color index
 
 doy_hue_index = doy_hue %>% 
   mutate(greenness = abs(mean_hue - 0.3),
@@ -278,6 +287,8 @@ greenness_mw = doy_hue_index %>%
   theme(axis.text.y.left = element_text(angle = 90, hjust = 0.5),
         axis.ticks.y = element_blank(),
         panel.grid.major.y = element_blank())
+
+greenness_mw
 
 greenness_mw %>% ggsave(
   filename = "figures/mw_greenness.png",
@@ -300,6 +311,8 @@ brownness_mk = doy_hue_index %>%
         axis.ticks.y = element_blank(),
         panel.grid.major.y = element_blank())
 
+brownness_mk
+
 brownness_mk %>% ggsave(
   filename = "figures/mk_brownness.png",
   width = 8,
@@ -317,6 +330,27 @@ doy_hue_index %>%
        y = "Blueness")
 ```
 
+## time series
+
+```{r}
+set.seed(2020)
+sublakes = dat %>% 
+  select(lake_id, region) %>% 
+  distinct() %>% 
+  group_by(region) %>% 
+  sample_n(100) %>% 
+  ungroup()
+
+sublakes %>%
+  left_join(dat, by = c("lake_id", "region")) %>% 
+  filter(date >= "2013-01-01") %>% 
+  mutate(plot_color = hsv(h = hue, s = 1, v = 1)) %>% 
+  ggplot(aes(x = date, y = hue, color = plot_color)) +
+  geom_line(aes(group = lake_id), lwd = 0.1, color = "black", alpha = 0.4) +
+  geom_point(size = 0.2) +
+  scale_color_identity() +
+  facet_wrap(~region, ncol = 1)
+```
 
 <!-- ## hydrolakes -->
 
