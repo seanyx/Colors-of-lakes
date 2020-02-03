@@ -1,0 +1,431 @@
+---
+title: "Lake color analysis"
+author: "Xiao Yang"
+date: "1/31/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+require(tidyverse)
+require(sf)
+require(foreach)
+```
+
+
+## Jida's lake data three regions
+
+```{r}
+calc_hue_density = function(hue) {
+  
+  d = density(hue, n = 512)
+  
+  hue_density = tibble(hue = d$x, density = d$y) %>% 
+    filter(hue >= 0, hue <= 1) %>% 
+    mutate(rgb_color = hsv(h = hue, s = 1, v = 1))
+  
+  return(hue_density)
+}
+calc_hue_color_bar = function(n = 100) {
+  return(tibble(hue = seq(0, 1, length = n)) %>% mutate(rgb_color = hsv(h = hue, s = 1, v = 1)))
+}
+
+fileinfo = tibble(
+  filedir = c(
+    "data/lake_color_00eb0576bf0b787389229e8cdae0501b_roi1.csv",
+    "data/lake_color_a5289e3a939da8e36cc68fd2ab107163_roi2.csv",
+    "data/lake_color_c88437fda564db2418327379fe8262bb_roi3.csv"
+  ),
+  region = c(
+    "Tibetan Plateau",
+    "Minnesota + Wisconsin",
+    "Mackenzie Delta"
+  ))
+
+dat = foreach(i = 1:nrow(fileinfo), .combine = "bind_rows") %do% {
+  read_csv(file = fileinfo$filedir[i]) %>% 
+    select(-`.geo`) %>% 
+    rename(img_id = `system:index`) %>% 
+    mutate(region = fileinfo$region[i])
+  }
+
+## need to handle the different date string position in the image ID
+
+dat = dat %>% 
+  mutate(img_id_rev = stri_reverse(img_id)) %>% 
+  separate(col = img_id_rev, into = c(NA, NA, "date_rev"), sep = "_") %>% 
+  mutate(date = as.Date(stri_reverse(date_rev), format = "%Y%m%d")) %>% select(-date_rev) %>% 
+  filter(cloudAndShadow == 0,
+         snowAndIce == 0) %>% 
+  select(
+    clon,
+    clat,
+    img_id,
+    date,
+    hue,
+    saturation,
+    value,
+    source,
+    region
+  )
+
+lake_id = dat %>% 
+  select(clon, clat) %>% 
+  distinct()
+
+lake_id = lake_id %>% 
+  mutate(lake_id = 1:nrow(.))
+
+dat = dat %>% 
+  left_join(lake_id, by = c("clon", "clat"))
+
+dat = dat %>% 
+  group_by(lake_id, date) %>% 
+  summarise(hue = median(hue),
+            value = median(value),
+            saturation = median(saturation),
+            clon = first(clon),
+            clat = first(clat),
+            source = first(source),
+            region = first(region)) %>% 
+  ungroup()
+
+save(dat, file = "outputs/lake_color_three_regions.RData")
+
+load("outputs/lake_color_three_regions.RData", verbose = T)
+
+## remove lakes with high brightness value and low saturation
+dat = dat %>% 
+  filter(saturation >= 0.3,
+         value <= 0.1)
+
+hue_density = dat %>% 
+  group_by(region) %>% 
+  do({
+    calc_hue_density(.$hue)
+  }) %>% 
+  ungroup
+  
+all_lake_color = hue_density %>% 
+  ggplot(aes(hue, density)) + 
+  geom_segment(aes(xend = hue, yend = 0, color = rgb_color), alpha = 0.7) + 
+  geom_line(lwd = 1) + 
+  scale_color_identity() +
+  scale_x_continuous(limits = c(0, 1), expand = c(0, 0)) +
+  labs(
+    y = "Density"
+  ) +
+  theme(
+    panel.background = element_blank(),
+    axis.title = element_blank(),
+    axis.text = element_blank(),
+    axis.ticks = element_blank()
+  ) +
+  facet_wrap(~region, ncol = 1)
+
+all_lake_color
+
+all_lake_color %>% 
+  ggsave(filename = "figures/all_lake_color_three_regions.png",
+         width = 6,
+         height = 7,
+         dpi = 300)
+
+
+## per lake density plot
+
+hue_density_lake = dat %>% 
+  right_join(dat %>% filter(saturation >= 0.3, value <= 0.1) %>% 
+              group_by(lake_id) %>% 
+              summarise(n = n()) %>% 
+              ungroup() %>% 
+              filter(n >= 30), by = "lake_id") %>% 
+  group_by(lake_id) %>% 
+  do({
+    dat_temp = .
+    calc_hue_density(dat_temp$hue) %>% 
+      mutate(n = nrow(dat_temp)) %>% 
+      mutate(region = dat_temp$region[1],
+             clon = dat_temp$clon[1],
+             clat = dat_temp$clat[1])
+  }) %>% 
+  ungroup()
+
+yshift = hue_density_lake %>% 
+  group_by(lake_id) %>% 
+  summarize(ymax = max(density),
+            region = first(region)) %>% 
+  arrange(ymax) %>% 
+  ungroup() %>% 
+  group_by(region) %>% 
+  mutate(yshift = 1:n()) %>% 
+  ungroup()
+  
+
+hue_density_lake = hue_density_lake %>% 
+  left_join(yshift, by = c("lake_id", "region"))
+
+yscale = hue_density_lake %>% group_by(lake_id, region) %>% summarize(stats = median(density)) %>% ungroup() %>% 
+  group_by(region) %>% 
+  summarise(scale = quantile(stats, probs = 0.3)) %>% 
+  ungroup
+
+hue_density_lake = hue_density_lake %>% 
+  left_join(yscale, by = "region")
+
+lake_color_per_lake = hue_density_lake %>% 
+  ggplot(aes(hue, density + yshift * scale)) + 
+  # geom_segment(data = calc_hue_color_bar(n = 512), aes(x = hue, y = 0, xend = hue, yend = hue_density_lake$density %>% max * 0.02, color = rgb_color), alpha = 1) +
+  # geom_line(aes(group = Hylak_id), alpha = 0.1) +
+  geom_segment(aes(xend = hue, yend = yshift * scale, color = rgb_color, group = lake_id), alpha = 0.1) + 
+  scale_color_identity() +
+  scale_x_continuous(limits = c(0, 1), expand = c(0, 0)) +
+  labs(
+    y = "Density"
+  ) +
+  theme(
+    panel.background = element_rect(color = "black", fill = "black"),
+    panel.grid = element_blank(),
+    axis.title = element_blank(),
+    axis.text = element_blank(),
+    axis.ticks = element_blank()
+  ) +
+  facet_wrap(~region, nrow = 1)
+
+lake_color_per_lake
+
+lake_color_per_lake %>% 
+  ggsave(filename = "figures/three_regions_lake_color_per_lake.png",
+         width = 15,
+         height = 6,
+         dpi = 100)
+
+## map mode color
+getmode <- function(v) {
+   uniqv <- unique(v)
+   uniqv[which.max(tabulate(match(v, uniqv)))]
+}
+
+color_mode = hue_density_lake %>% 
+  group_by(lake_id, region) %>% 
+  summarise(hue_mode = hue[which.max(density)],
+            clon = first(clon),
+            clat = first(clat)) %>% 
+  ungroup() %>% 
+  mutate(rgb_color = hsv(h = hue_mode, s = 1, v = 1))
+
+color_mode_sf = color_mode %>% 
+  st_as_sf(coords = c("clon", "clat"), crs = 4326)
+
+mapview::mapview(color_mode_sf, zcol = "hue_mode", color = hsv(h = seq(0.1311, 0.4514, length = 100), s = 1, v = 1), fill = NA)
+```
+
+
+## seasonality
+
+```{r}
+require(lubridate)
+
+doy_hue = dat %>% 
+  mutate(doy = yday(date)) %>% 
+  group_by(lake_id, doy) %>% 
+  summarise(mean_hue = mean(hue),
+            region = first(region)) %>% 
+  ungroup()
+
+lake_color_seasonality = doy_hue %>% 
+  mutate(plotcolor = hsv(h = mean_hue, s = 1, v = 1)) %>% 
+  ggplot() +
+  geom_point(aes(x = doy, y = mean_hue, group = lake_id, color = plotcolor), alpha = 0.3, size = 0.05) +
+  labs(x = "Day of the year") +
+  ylim(0, 0.75) +
+  scale_color_identity() +
+  facet_wrap(~region) +
+  theme(
+    panel.background = element_rect(color = "black", fill = "black"),
+    panel.grid = element_blank(),
+    axis.title.y = element_blank(),
+    axis.text.y = element_blank(),
+    axis.ticks.y = element_blank()
+  )
+
+lake_color_seasonality
+
+lake_color_seasonality %>% 
+  ggsave(
+    filename = "figures/lake_color_seasonality.png",
+    width = 7,
+    height = 3,
+    dpi = 300
+  )
+
+doy_hue_index = doy_hue %>% 
+  mutate(greenness = abs(mean_hue - 0.3),
+         blueness = abs(mean_hue - 0.6),
+         brownness = abs(mean_hue - 0.1))
+
+greenness_mw = doy_hue_index %>% 
+  filter(region == "Minnesota + Wisconsin") %>% 
+  ggplot() +
+  geom_smooth(aes(x = doy, y = greenness, group = lake_id), lwd = 0.1, se = F, show.legend = F, color = "darkgreen") +
+  geom_point(aes(doy, y = greenness), size = 0.1, alpha = 0.1) + 
+  geom_smooth(aes(x = doy, y = greenness), color = "green") +
+  scale_y_reverse(minor_breaks = NULL, breaks = c(0.025, 0.275), labels = c("More green", "Less green"), lim = c(0.3, 0)) +
+  labs(x = "Day of the year",
+       y = "Greenness (hue ref: 0.3)",
+       title = "Greenness for lakes from Minnesota + Wisconsin") +
+  theme(axis.text.y.left = element_text(angle = 90, hjust = 0.5),
+        axis.ticks.y = element_blank(),
+        panel.grid.major.y = element_blank())
+
+greenness_mw %>% ggsave(
+  filename = "figures/mw_greenness.png",
+  width = 8,
+  height = 5,
+  dpi = 300
+)
+
+brownness_mk = doy_hue_index %>% 
+  filter(region == "Mackenzie Delta") %>% 
+  ggplot() +
+  geom_smooth(aes(x = doy, y = brownness, group = lake_id), lwd = 0.1, se = F, show.legend = F, color = "brown") +
+  geom_point(aes(doy, y = brownness), size = 0.1, alpha = 0.1) + 
+  geom_smooth(aes(x = doy, y = brownness), color = "yellow") +
+  scale_y_reverse(minor_breaks = NULL, breaks = c(0.025, 0.475), labels = c("More brown", "Less brown")) +
+  labs(x = "Day of the year",
+       y = "Brownness (ref hue: 0.1)",
+       title = "Brownness for lakes from Mackenzie Delta") +
+  theme(axis.text.y.left = element_text(angle = 90, hjust = 0.5),
+        axis.ticks.y = element_blank(),
+        panel.grid.major.y = element_blank())
+
+brownness_mk %>% ggsave(
+  filename = "figures/mk_brownness.png",
+  width = 8,
+  height = 5,
+  dpi = 300
+)
+
+doy_hue_index %>% 
+  filter(region == "Tibetan Plateau") %>% 
+  ggplot() +
+  geom_point(aes(doy, y = blueness), size = 0.1, alpha = 0.3) + 
+  geom_smooth(aes(x = doy, y = blueness), color = "blue") +
+  # ylim(0, 0.3) +
+  labs(x = "Day of the year",
+       y = "Blueness")
+```
+
+
+<!-- ## hydrolakes -->
+
+<!-- ```{r} -->
+<!-- dat = read_csv(file = "data/lake_color_f247c809ee74fd2458b96420f42f876d.csv") %>%  -->
+<!--   select(-`.geo`) %>%  -->
+<!--   rename(img_id = `system:index`) -->
+
+<!-- dat = dat %>%  -->
+<!--   mutate(date = as.Date(substr(img_id, start = 15, stop = 22), format = "%Y%m%d")) %>%  -->
+<!--   filter(cloudAndShadow == 0, -->
+<!--          snowAndIce == 0) %>%  -->
+<!--   select( -->
+<!--     clon, -->
+<!--     clat, -->
+<!--     img_id, -->
+<!--     Hylak_id, -->
+<!--     date, -->
+<!--     hue, -->
+<!--     saturation, -->
+<!--     value -->
+<!--   ) -->
+
+<!-- dat %>%  -->
+<!--   ggplot() + -->
+<!--   geom_density(aes(hue, color = Hylak_id)) -->
+
+<!-- calc_hue_density = function(hue) { -->
+
+<!--   d = density(hue, n = 512) -->
+
+<!--   hue_density = tibble(hue = d$x, density = d$y) %>%  -->
+<!--     filter(hue >= 0, hue <= 1) %>%  -->
+<!--     mutate(rgb_color = hsv(h = hue, s = 1, v = 1)) -->
+
+<!--   return(hue_density) -->
+<!-- } -->
+<!-- calc_hue_color_bar = function(n = 100) { -->
+<!--   return(tibble(hue = seq(0, 1, length = n)) %>% mutate(rgb_color = hsv(h = hue, s = 1, v = 1))) -->
+<!-- } -->
+
+<!-- hue_density = calc_hue_density(dat$hue) -->
+
+
+<!-- MN_lake_color = hue_density %>%  -->
+<!--   ggplot(aes(hue, density)) +  -->
+<!--   geom_segment(aes(xend = hue, yend = 0, color = rgb_color), alpha = 0.7) +  -->
+<!--   geom_line(lwd = 1) +  -->
+<!--   scale_color_identity() + -->
+<!--   scale_x_continuous(limits = c(0, 1), expand = c(0, 0)) + -->
+<!--   labs( -->
+<!--     y = "Density" -->
+<!--   ) + -->
+<!--   theme( -->
+<!--     panel.background = element_blank(), -->
+<!--     axis.title = element_blank(), -->
+<!--     axis.text = element_blank(), -->
+<!--     axis.ticks = element_blank() -->
+<!--   ) -->
+
+<!-- MN_lake_color -->
+
+
+<!-- ## per lake density plot -->
+
+<!-- hue_density_lake = dat %>%  -->
+<!--   group_by(Hylak_id) %>%  -->
+<!--   do({ -->
+<!--     calc_hue_density(.$hue) %>%  -->
+<!--       mutate(n = nrow(.)) -->
+<!--   }) %>%  -->
+<!--   ungroup() -->
+
+<!-- yshift = hue_density_lake %>%  -->
+<!--   group_by(Hylak_id) %>%  -->
+<!--   summarize(ymax = max(density)) %>%  -->
+<!--   ungroup() %>%  -->
+<!--   arrange(ymax) %>%  -->
+<!--   select(Hylak_id) %>% -->
+<!--   mutate(yshift = 1:nrow(.)) -->
+
+<!-- hue_density_lake = hue_density_lake %>%  -->
+<!--   left_join(yshift, by = "Hylak_id") -->
+
+<!-- yscale = hue_density_lake %>% group_by(Hylak_id) %>% summarize(stats = median(density)) %>% ungroup() %>% pull(stats) %>% quantile(probs = 0.1) -->
+
+<!-- MN_lake_color_per_lake = hue_density_lake %>%  -->
+<!--   ggplot(aes(hue, density + yshift * yscale)) +  -->
+<!--   # geom_segment(data = calc_hue_color_bar(n = 512), aes(x = hue, y = 0, xend = hue, yend = hue_density_lake$density %>% max * 0.02, color = rgb_color), alpha = 1) + -->
+<!--   # geom_line(aes(group = Hylak_id), alpha = 0.1) + -->
+<!--   geom_segment(aes(xend = hue, yend = yshift * yscale, color = rgb_color, group = Hylak_id), alpha = 0.1) +  -->
+<!--   scale_color_identity() + -->
+<!--   scale_x_continuous(limits = c(0, 1), expand = c(0, 0)) + -->
+<!--   labs( -->
+<!--     y = "Density" -->
+<!--   ) + -->
+<!--   theme( -->
+<!--     panel.background = element_rect(color = "black", fill = "black"), -->
+<!--     panel.grid = element_blank(), -->
+<!--     axis.title = element_blank(), -->
+<!--     axis.text = element_blank(), -->
+<!--     axis.ticks = element_blank() -->
+<!--   ) -->
+
+<!-- MN_lake_color_per_lake -->
+
+<!-- MN_lake_color_per_lake %>%  -->
+<!--   ggsave(filename = "figures/MN_lake_color_per_lake.png", -->
+<!--          width = 8, -->
+<!--          height = 6, -->
+<!--          dpi = 100) -->
+<!-- ``` -->
