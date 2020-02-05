@@ -352,6 +352,40 @@ sublakes %>%
   facet_wrap(~region, ncol = 1)
 ```
 
+
+## time series spectral analysis
+
+```{r}
+require(spectral)
+
+this_lake = dat %>% 
+  filter(region == "Minnesota + Wisconsin",
+         lake_id == 110) %>% 
+  mutate(t = as.integer(date - as.Date("1983-01-01")) / 365.25)
+
+ymean = mean(this_lake$hue)
+
+this_lake = this_lake %>% 
+  mutate(y = hue - ymean)
+
+this_lake %>% ggplot() + geom_point(aes(yday(date), hue))
+this_lake %>% ggplot() + geom_line(aes(t, hue), color = "grey") + geom_point(aes(t, hue))
+
+periodogram = spec.lomb(x = this_lake$t, y = this_lake$y, ofac = 20, mode = "generalized")
+
+plot(periodogram)
+
+# select a frequency range
+m = c(0.02, 4)
+# select and reconstruct the most significant component
+l2 = filter.lomb(periodogram, newx = seq(0, 35.5, length = 1000), filt = m, threshold = 6)
+
+plot(this_lake$t, this_lake$y, type = "p")
+lines(this_lake$t, this_lake$y)
+lines(l2$x, l2$y, col = "red")
+```
+
+
 <!-- ## hydrolakes -->
 
 <!-- ```{r} -->
