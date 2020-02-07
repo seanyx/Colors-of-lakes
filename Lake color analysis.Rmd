@@ -35,9 +35,9 @@ calc_hue_color_bar = function(n = 100) {
 
 fileinfo = tibble(
   filedir = c(
-    "data/lake_color_00eb0576bf0b787389229e8cdae0501b_roi1.csv",
-    "data/lake_color_a5289e3a939da8e36cc68fd2ab107163_roi2.csv",
-    "data/lake_color_c88437fda564db2418327379fe8262bb_roi3.csv"
+    "data/mean_lake_color_roi1_8ba054ab336634e127d548f925681daf.csv",
+    "data/mean_lake_color_roi2_dd85cb7c10dd310b1d3d1c93de39514c.csv",
+    "data/mean_lake_color_roi3_c4549c94182362691561ca5712438d23.csv"
   ),
   region = c(
     "Tibetan Plateau",
@@ -47,29 +47,31 @@ fileinfo = tibble(
 
 dat = foreach(i = 1:nrow(fileinfo), .combine = "bind_rows") %do% {
   read_csv(file = fileinfo$filedir[i]) %>% 
-    select(-`.geo`) %>% 
-    rename(img_id = `system:index`) %>% 
     mutate(region = fileinfo$region[i])
-  }
+} %>% 
+    select(-`.geo`) %>% 
+    rename(img_id = `system:index`)
 
 ## need to handle the different date string position in the image ID
 
 dat = dat %>% 
-  mutate(img_id_rev = stri_reverse(img_id)) %>% 
-  separate(col = img_id_rev, into = c(NA, NA, "date_rev"), sep = "_") %>% 
-  mutate(date = as.Date(stri_reverse(date_rev), format = "%Y%m%d")) %>% select(-date_rev) %>% 
   filter(cloudAndShadow == 0,
-         snowAndIce == 0) %>% 
+         snowAndIce == 0,
+         Red >= 0,
+         Red <= 10000,
+         Green >= 0,
+         Green <= 10000,
+         Blue >= 0,
+         Blue <= 10000,
+         !is.na(hue)) %>% 
+  mutate(img_id_rev = stringi::stri_reverse(img_id)) %>% 
+  separate(col = img_id_rev, into = c(NA, NA, NA, "satellite"), sep = "_") %>% 
+  mutate(satellite = paste0("Landsat ", substr(satellite, start = 1, stop = 1))) %>% 
   select(
-    clon,
-    clat,
-    img_id,
-    date,
-    hue,
-    saturation,
-    value,
-    source,
-    region
+    -BQA,
+    -cloudAndShadow,
+    -snowAndIce,
+    -uBlue
   )
 
 lake_id = dat %>% 
@@ -82,25 +84,68 @@ lake_id = lake_id %>%
 dat = dat %>% 
   left_join(lake_id, by = c("clon", "clat"))
 
-dat = dat %>% 
-  group_by(lake_id, date) %>% 
-  summarise(hue = median(hue),
-            value = median(value),
-            saturation = median(saturation),
-            clon = first(clon),
-            clat = first(clat),
-            source = first(source),
-            region = first(region)) %>% 
-  ungroup()
+save(dat, file = "outputs/lake_color_three_regions_20200205.RData")
 
-save(dat, file = "outputs/lake_color_three_regions.RData")
+load("outputs/lake_color_three_regions_20200205.RData", verbose = T)
 
-load("outputs/lake_color_three_regions.RData", verbose = T)
 
-## remove lakes with high brightness value and low saturation
-dat = dat %>% 
-  filter(saturation >= 0.3,
-         value <= 0.1)
+## range of values of hsv
+dat %>% 
+  gather(key = hsv, value = "value", c(hue, saturation, value)) %>% 
+  select(hsv, value) %>% 
+  ggplot() +
+  geom_density(aes(value, fill = hsv), alpha = 0.3)
+
+# remove lakes with high brightness value and low saturation
+dat = dat %>%
+  filter(saturation >= 0.125,
+         value <= 0.125)
+
+dat %>% 
+  select(region, lake_id) %>% 
+  distinct() %>% 
+  group_by(region) %>% 
+  count() %>% 
+  ungroup
+
+
+## regional distribution
+
+hue_density_region = dat %>% 
+  mutate(month = factor(month(date), levels = 1:12, labels = month.abb)) %>% 
+  group_by(region) %>% 
+  do({
+    calc_hue_density(.$hue)
+  }) %>% 
+  ungroup
+  
+all_lake_color_region = hue_density_region %>% 
+  ggplot(aes(hue, density)) + 
+  geom_segment(aes(xend = hue, yend = 0, color = rgb_color), alpha = 0.7) + 
+  geom_line(lwd = 1) + 
+  scale_color_identity() +
+  scale_x_continuous(limits = c(0, 1)) +
+  labs(
+    x = "Hue"
+  ) +
+  theme(
+    panel.background = element_blank(),
+    axis.title.y = element_blank(),
+    axis.text.y = element_blank(),
+    axis.ticks.y = element_blank()
+  ) +
+  facet_wrap(~region, ncol = 1)
+
+all_lake_color_region
+
+all_lake_color_region %>% 
+  ggsave(filename = "figures/all_lake_color_three_regions_20200205.png",
+         width = 6,
+         height = 6,
+         dpi = 300)
+
+
+## monthly breakdown
 
 hue_density = dat %>% 
   mutate(month = factor(month(date), levels = 1:12, labels = month.abb)) %>% 
@@ -125,12 +170,12 @@ all_lake_color = hue_density %>%
     axis.text = element_blank(),
     axis.ticks = element_blank()
   ) +
-  facet_grid(month~region)
+  facet_grid(month~region, scales = "free_y")
 
 all_lake_color
 
 all_lake_color %>% 
-  ggsave(filename = "figures/all_lake_color_three_regions_monthly.png",
+  ggsave(filename = "figures/all_lake_color_three_regions_monthly_20200205.png",
          width = 6,
          height = 7,
          dpi = 300)
@@ -139,7 +184,7 @@ all_lake_color %>%
 ## per lake density plot
 
 hue_density_lake = dat %>% 
-  right_join(dat %>% filter(saturation >= 0.3, value <= 0.1) %>% 
+  right_join(dat %>% 
               group_by(lake_id) %>% 
               summarise(n = n()) %>% 
               ungroup() %>% 
@@ -199,7 +244,7 @@ lake_color_per_lake = hue_density_lake %>%
 lake_color_per_lake
 
 lake_color_per_lake %>% 
-  ggsave(filename = "figures/three_regions_lake_color_per_lake.png",
+  ggsave(filename = "figures/three_regions_lake_color_per_lake_20200205.png",
          width = 15,
          height = 6,
          dpi = 100)
@@ -231,13 +276,12 @@ mapview::mapview(color_mode_sf, zcol = "hue_mode", color = hsv(h = seq(0.1311, 0
 require(lubridate)
 
 doy_hue = dat %>% 
-  # filter(saturation >= 0.3,
-  #        value <= 0.1) %>% 
   mutate(doy = yday(date)) %>% 
   group_by(lake_id, doy) %>% 
   summarise(mean_hue = mean(hue),
             mean_sat = mean(saturation),
-            region = first(region)) %>% 
+            region = first(region),
+            date = first(date)) %>% 
   ungroup()
 
 lake_color_seasonality = doy_hue %>% 
@@ -261,7 +305,7 @@ lake_color_seasonality
 
 lake_color_seasonality %>% 
   ggsave(
-    filename = "figures/lake_color_seasonality_filtered.png",
+    filename = "figures/lake_color_seasonality_filtered_20200205.png",
     width = 7,
     height = 3,
     dpi = 300
@@ -291,7 +335,7 @@ greenness_mw = doy_hue_index %>%
 greenness_mw
 
 greenness_mw %>% ggsave(
-  filename = "figures/mw_greenness.png",
+  filename = "figures/mw_greenness_20200205.png",
   width = 8,
   height = 5,
   dpi = 300
@@ -301,7 +345,7 @@ brownness_mk = doy_hue_index %>%
   filter(region == "Mackenzie Delta") %>% 
   ggplot() +
   geom_smooth(aes(x = doy, y = brownness, group = lake_id), lwd = 0.1, se = F, show.legend = F, color = "brown") +
-  geom_point(aes(doy, y = brownness), size = 0.1, alpha = 0.1) + 
+  geom_point(aes(doy, y = brownness), size = 0.1, alpha = 0.2) + 
   geom_smooth(aes(x = doy, y = brownness), color = "yellow") +
   scale_y_reverse(minor_breaks = NULL, breaks = c(0.025, 0.475), labels = c("More brown", "Less brown")) +
   labs(x = "Day of the year",
@@ -314,7 +358,7 @@ brownness_mk = doy_hue_index %>%
 brownness_mk
 
 brownness_mk %>% ggsave(
-  filename = "figures/mk_brownness.png",
+  filename = "figures/mk_brownness_20200205.png",
   width = 8,
   height = 5,
   dpi = 300
@@ -323,6 +367,7 @@ brownness_mk %>% ggsave(
 doy_hue_index %>% 
   filter(region == "Tibetan Plateau") %>% 
   ggplot() +
+  geom_smooth(aes(x = doy, y = blueness, group = lake_id), lwd = 0.1, se = F, show.legend = F, color = "darkblue") +
   geom_point(aes(doy, y = blueness), size = 0.1, alpha = 0.3) + 
   geom_smooth(aes(x = doy, y = blueness), color = "blue") +
   # ylim(0, 0.3) +
@@ -351,6 +396,127 @@ sublakes %>%
   scale_color_identity() +
   facet_wrap(~region, ncol = 1)
 ```
+
+## temporal changes
+
+```{r}
+doy_hue_index = doy_hue %>% 
+  mutate(greenness = abs(mean_hue - 0.3),
+         blueness = abs(mean_hue - 0.6),
+         brownness = abs(mean_hue - 0.1))
+
+## running window tibble
+window_size = 8
+increment = 5
+
+start_dates = seq(1984, 2020, by = increment)
+end_dates = start_dates + window_size
+
+start_dates = as.Date(paste0(start_dates, "-01-01"))
+end_dates = as.Date(paste0(end_dates, "-01-01"))
+
+windowed = tibble(start_dates, end_dates) %>% 
+  filter(end_dates <= as.Date("2020-01-01")) %>% 
+  mutate(label = paste0(year(start_dates), "-", year(end_dates) - 1)) %>% 
+  mutate(mean_year = floor((year(start_dates) + year(end_dates)) / 2)) %>% 
+  group_by(label) %>% 
+  do({
+    dat = .
+    doy_hue_index %>% 
+      filter(date <= dat$end_dates[1], date >= dat$start_dates[1]) %>% 
+      mutate(
+        start_date = dat$start_dates[1],
+        end_date = dat$end_dates[1], 
+        mean_year = dat$mean_year[1])
+  }) %>% 
+  ungroup()
+
+
+windowed %>% 
+  ggplot() +
+  geom_bar(aes(x = label, fill = region), position = "dodge") +
+  theme(axis.text.x.bottom = element_text(angle = 45, hjust = 1))
+# plot the data
+
+greenness_mw = windowed %>% 
+  filter(region == "Minnesota + Wisconsin") %>% 
+  ggplot() +
+  # geom_smooth(aes(x = doy, y = greenness, group = lake_id), lwd = 0.1, se = F, show.legend = F, color = "darkgreen") +
+  # geom_point(aes(doy, y = greenness), size = 0.1, alpha = 0.1) + 
+  geom_smooth(aes(x = doy, y = greenness, color = mean_year, group = mean_year)) +
+  scale_y_reverse(minor_breaks = NULL, breaks = c(0.025, 0.275), labels = c("More green", "Less green"), lim = c(0.3, 0)) +
+  labs(x = "Day of the year",
+       y = "Greenness (hue ref: 0.3)",
+       title = "Greenness for lakes from Minnesota + Wisconsin",
+       color = "Centered year") +
+  theme(axis.text.y.left = element_text(angle = 90, hjust = 0.5),
+        axis.ticks.y = element_blank(),
+        panel.grid.major.y = element_blank()) +
+  scale_color_viridis_c()
+
+greenness_mw
+
+greenness_mw %>% ggsave(
+  filename = "figures/mw_greenness_20200207_temporal.png",
+  width = 8,
+  height = 5,
+  dpi = 300
+)
+
+
+brownness_mk = windowed %>% 
+  filter(region == "Mackenzie Delta") %>% 
+  ggplot() +
+  # geom_smooth(aes(x = doy, y = greenness, group = lake_id), lwd = 0.1, se = F, show.legend = F, color = "darkgreen") +
+  # geom_point(aes(doy, y = greenness), size = 0.1, alpha = 0.1) + 
+  geom_smooth(aes(x = doy, y = brownness, color = mean_year, group = mean_year)) +
+  scale_y_reverse(minor_breaks = NULL, breaks = c(0.025, 0.275), labels = c("More brown", "Less brown"), lim = c(0.3, 0)) +
+  labs(x = "Day of the year",
+       y = "Brownness (hue ref: 0.1)",
+       title = "Brownness for lakes from Mackenzie Delta",
+       color = "Centered year") +
+  theme(axis.text.y.left = element_text(angle = 90, hjust = 0.5),
+        axis.ticks.y = element_blank(),
+        panel.grid.major.y = element_blank()) +
+  scale_color_viridis_c()
+
+brownness_mk
+
+brownness_mk %>% ggsave(
+  filename = "figures/mk_brownness_20200205_temporal.png",
+  width = 8,
+  height = 5,
+  dpi = 300
+)
+
+
+
+
+lake_id_sample = windowed %>% 
+  filter(region == "Minnesota + Wisconsin") %>% 
+  select(lake_id) %>% 
+  distinct() %>% 
+  sample_n(10)
+
+windowed %>% 
+  filter(region == "Minnesota + Wisconsin") %>% 
+  right_join(lake_id_sample, by = "lake_id") %>% 
+  ggplot() +
+  geom_smooth(aes(x = doy, y = greenness, color = mean_year, group = mean_year), lwd = 0.3, se = F) +
+  # geom_point(aes(doy, y = greenness), size = 0.1, alpha = 0.1) + 
+  # geom_smooth(aes(x = doy, y = greenness, color = mean_year, group = mean_year)) +
+  scale_y_reverse(minor_breaks = NULL, breaks = c(0.025, 0.275), labels = c("More green", "Less green"), lim = c(0.3, 0)) +
+  labs(x = "Day of the year",
+       y = "Greenness (hue ref: 0.3)",
+       title = "Greenness for lakes from Minnesota + Wisconsin",
+       color = "Centered year") +
+  theme(axis.text.y.left = element_text(angle = 90, hjust = 0.5),
+        axis.ticks.y = element_blank(),
+        panel.grid.major.y = element_blank()) +
+  scale_color_viridis_c() +
+  facet_wrap(~lake_id)
+```
+
 
 
 ## time series spectral analysis
