@@ -397,6 +397,435 @@ sublakes %>%
   facet_wrap(~region, ncol = 1)
 ```
 
+## monthly dominant colors
+
+```{r}
+load("outputs/lake_color_three_regions_20200205.RData", verbose = T)
+
+monthly = dat %>% 
+  mutate(month = factor(month(date), levels = 1:12, labels = month.name)) %>% 
+  filter(date >= as.Date("2014-01-01"))
+
+monthly %>% 
+  filter(region == "Mackenzie Delta",
+         lake_id == 877) %>% 
+  ggplot() +
+  geom_density(aes(x = hue, color = month, group = month))
+  # geom_histogram(aes(x = hue, color = month))
+
+month_mod_color = monthly %>% 
+  group_by(lake_id, month) %>% 
+  mutate(n = n()) %>% 
+  ungroup() %>% 
+  filter(n > 2) %>% 
+  group_by(lake_id, month) %>% 
+  do({
+    dat = .
+    d = density(dat$hue)
+    tibble(mod_hue = d$x[which.max(d$y)]) %>% 
+      mutate(clon = dat$clon[1],
+             clat = dat$clat[1],
+             region = dat$region[1])
+  }) %>% 
+  ungroup() %>% 
+  mutate(plotcolor = hsv(h = mod_hue, s = 1, v = 0.7, alpha = 0.3))
+
+save(month_mod_color, file = "monthly_mod_color.RData")
+
+
+require(ggmap)
+require(gganimate)
+
+region_bbox = month_mod_color %>% 
+  group_by(region) %>% 
+  summarise(lat_min = min(clat),
+            lat_max = max(clat),
+            lon_min = min(clon),
+            lon_max = max(clon)) %>% 
+  ungroup()
+
+region_index = 3
+
+this_region_bbox = region_bbox[region_index, ]
+this_region = this_region_bbox$region
+
+map = get_stamenmap(c(
+  this_region_bbox$lon_min, 
+  this_region_bbox$lat_min, 
+  this_region_bbox$lon_max, 
+  this_region_bbox$lat_max), maptype = "terrain", zoom = 8)
+
+multipanel_map = ggmap(map, darken = c(0.7, "black")) +
+  geom_point(data = month_mod_color %>% 
+            filter(region == this_region), mapping = aes(x = clon, y = clat, color = plotcolor, group = month), alpha = 0.7) +
+  scale_color_identity() +
+  labs(title = paste("Lake color seasonality: ", this_region),
+     x = "Longitude",
+     y = "Latitude") +
+  facet_wrap(~month) +
+  theme(title = element_text(size = 14))
+
+# multipanel_map
+
+multipanel_map %>% 
+  ggsave(filename = paste0("figs/", this_region, "_monthly_maps.png"), 
+         width = 10,
+         height = 8,
+         dpi = 300)
+
+g = ggmap(map, darken = c(0.7, "black")) +
+  geom_point(data = month_mod_color %>% 
+            filter(region == this_region), mapping = aes(x = clon, y = clat, color = plotcolor, group = month), alpha = 0.8) +
+  scale_color_identity() +
+  labs(title = "Lake color seasonality: {month.name[frame_time]}",
+       x = "Longitude",
+       y = "Latitude") +
+  transition_time(time = as.integer(month)) +
+  theme(title = element_text(size = 18))
+
+anim_save(filename = paste0(this_region, "_monthly_animation.gif"), animation = g, duration = 12, path = "figs", end_pause = 10)
+```
+
+## cluster analysis
+
+```{r}
+# https://www.statmethods.net/advstats/cluster.html
+
+load("outputs/lake_color_three_regions_20200205.RData", verbose = T)
+
+dat = dat %>%
+  filter(date >= as.Date("2014-01-01"))
+
+lake_info = dat %>% 
+  select(clon, clat, lake_id, region) %>% 
+  distinct()
+
+# remove lakes with high brightness value and low saturation
+
+
+monthly_data = dat %>% 
+  mutate(month = factor(month(date), levels = 1:12, labels = month.abb)) %>%
+  group_by(lake_id, month) %>% 
+  mutate(n = n()) %>% 
+  ungroup() %>% 
+  filter(n > 2) %>% 
+  group_by(lake_id, month) %>% 
+  do({
+    dat = .
+    d = density(dat$hue)
+    tibble(mod_hue = d$x[which.max(d$y)]) %>% 
+      mutate(clon = dat$clon[1],
+             clat = dat$clat[1],
+             region = dat$region[1],
+             mean_hue = mean(dat$hue))
+  }) %>% 
+  ungroup() %>% 
+  mutate(hue = mean_hue)
+
+month_range = tibble(
+  region = c("Mackenzie Delta", "Minnesota + Wisconsin", "Tibetan Plateau"),
+  min_month = c(6, 4, 4),
+  max_month = c(9, 11, 12)
+)
+
+obs_monthly_dist = monthly_data %>% 
+  ggplot() +
+  geom_bar(aes(x = as.integer(month))) +
+  scale_x_continuous(breaks = 1:12, labels = month.abb) +
+  facet_wrap(~region, ncol = 1, scales = "free_y") +
+  labs(x = "",
+       y = "Count") +
+  geom_segment(data = month_range, aes(x = min_month, y = 0, xend = max_month, yend = 0), color = "green", lwd = 2)
+
+obs_monthly_dist
+
+obs_monthly_dist %>% 
+  ggsave(filename = "figs/obs_monthly_dist.png",
+         width = 7,
+         height = 7)
+  
+# this_region = "Mackenzie Delta"
+# this_region = "Minnesota + Wisconsin"
+# this_region = "Tibetan Plateau"
+
+temp = month_range %>% filter(region == this_region)
+
+training = monthly_data %>% 
+  filter(region == this_region) %>% 
+  filter(as.integer(month) >= temp$min_month[1], as.integer(month) <= temp$max_month[1]) %>% 
+  select(month, hue, lake_id) %>% 
+  group_by(lake_id) %>% 
+  mutate(
+    mean_hue = mean(hue),
+    sd_hue = sd(hue),
+    hue_norm = (hue - mean_hue) / sd_hue,
+         ) %>% 
+  ungroup() %>% 
+  select(-hue) %>% 
+  spread(key = month, value = hue_norm, fill = NA) %>% 
+  na.omit()
+
+mean_sd = training %>% 
+  select(lake_id, mean_hue, sd_hue) %>% 
+  distinct()
+
+
+
+
+N = 3
+
+### kmeans cluster
+
+fit_kmeans = kmeans(training %>% select(-lake_id, -mean_hue, -sd_hue), N) # 5 cluster solution
+
+# plotcluster(training %>% select(-lake_id), fit$cluster)
+# library(cluster)
+# clusplot(training %>% select(-lake_id), fit$cluster, color = TRUE, shade = TRUE,
+#    labels = 0, lines = 0)
+
+clustered = training %>% 
+  mutate(class = fit_kmeans$cluster,
+         method = "K-means")
+  
+
+month_names = (fit_kmeans$centers %>% dimnames())[[2]]
+
+cluster_means = fit_kmeans$centers %>% 
+  t() %>% 
+  as_tibble() %>% 
+  bind_cols(tibble(month_nm = month_names)) %>% 
+  gather(key = "class", value = "hue", -month_nm) %>% 
+  inner_join(tibble(month = 1:12, month_nm = month.abb)) %>% 
+  mutate(method = "K-means")
+
+### DTW based clustering
+
+library(dtw)
+library(TSclust)
+library(dtwclust)
+library(zoo)
+
+training_dtw = training %>% 
+  select(-lake_id, -mean_hue, -sd_hue) %>% 
+  as.matrix()
+
+cluster_dtw = tsclust(training_dtw, type = "h", k = N, distance = "dtw_basic",
+                      centroid = dba, control =hierarchical_control(method = "complete"),
+                      preproc = NULL)
+
+## append class 
+
+clustered = clustered %>% 
+  bind_rows(clustered %>% 
+              mutate(class = cluster_dtw@cluster,
+                     method = "DTW"))
+clustered = clustered %>% mutate(class = as.character(class))
+
+## reconstruct cluster  mean
+centroids = cluster_dtw@centroids
+names(centroids) = paste0(1:N)
+centroids = as_tibble(centroids) %>% 
+  t() %>% 
+  as_tibble()
+names(centroids) = month_names
+centroids = centroids %>% 
+  mutate(class_dtw = 1:N) %>% 
+  gather(key = "month_nm", value = "hue", -class_dtw) %>% 
+  rename(class = class_dtw) %>% 
+  mutate(method = "DTW") %>% 
+  inner_join(tibble(month = 1:12, month_nm = month.abb), by = "month_nm")
+
+
+merged_means = centroids %>% 
+  mutate(class = as.character(class)) %>% 
+  bind_rows(cluster_means)
+
+# plot(cluster_dtw, type = "c", color = "grey") 
+# 
+# lake_id = training_all %>% 
+#   bind_cols(tibble(cluster_dtw = this_clustering@cluster))
+# 
+# this_clustering_mean = this_clustering@centroid
+
+## plot cluster results
+
+estimated_doy = merged_means %>% 
+  mutate(doy = yday(as.Date(paste0("2015-", month, "-15")))) %>% 
+  inner_join(clustered)
+
+cluster_center_fig = estimated_doy %>% 
+  ggplot(aes(x = month, y = hue, color = class)) +
+  geom_line(alpha = 0.7) +
+  geom_point(size = 2) +
+  facet_wrap(~method) +
+  labs(
+    x = "Month",
+    y = "Normalized Hue",
+    color = "Class"
+  )
+
+cluster_center_fig
+
+cluster_center_fig %>% 
+  ggsave(filename = paste0("figs/", this_region, "_cluster_center_fig.png"),
+         width = 7,
+         height = 5)
+
+dat_clustered = dat %>% 
+  select(lake_id, clat, clon, date, region, hue) %>% 
+  mutate(doy = yday(date)) %>% 
+  inner_join(clustered %>% 
+               select(lake_id, 
+                      class,
+                      method), by = "lake_id")
+
+doy_series_clustered = dat_clustered %>% 
+  ggplot(aes(x = doy, y = hue, group = lake_id, color = class)) +
+  geom_smooth(alpha = 0.2, lwd = 0.1, se = F) +
+  facet_grid(method~class) +
+  # scale_x_continuous(limits = c(150, 275)) +
+  scale_color_viridis_d(end = 0.8) +
+  labs(
+    x = "DOY",
+    y = "Hue",
+    color = "Class"
+  )
+
+doy_series_clustered
+
+doy_series_clustered %>% 
+  ggsave(
+    filename = paste0("figs/", this_region, "_doy_series_clustered.png"),
+    width = 8,
+    height = 6
+  )
+
+cluster_patterns = monthly_data %>%
+  filter(region == this_region) %>%
+  group_by(lake_id) %>%
+  mutate(hue_norm = (hue - mean(hue)) / sd(hue)) %>%
+  ungroup() %>%
+  inner_join(clustered %>% select(-mean_hue), by = "lake_id") %>%
+  ggplot() +
+  # geom_smooth(aes(x = month, y = hue_norm, group = lake_id), alpha = 0.2, size = 0.1, se = F, method = 'loess', formula = 'y ~ x') +
+  geom_line(aes(x = as.integer(month), y = hue_norm, group = lake_id), alpha = 0.5, size = 0.1) +
+  geom_line(data = merged_means, aes(x = month, y = hue, color = "Cluster mean")) +
+  geom_point(aes(x = as.integer(month), y = hue_norm), alpha = 0.1, size = 0.1) +
+  scale_x_continuous(limits = c(temp$min_month[1], temp$max_month[1])) +
+  facet_grid(method~class) +
+  labs(x = "Month",
+       y = "Normalized Hue",
+       color = "Legend") +
+  theme(legend.position = "bottom",
+        legend.direction = "horizontal")
+
+cluster_patterns
+
+cluster_patterns %>%
+  ggsave(filename = paste0("figs/", this_region, "_cluster_patterns.png"),
+         width = 8,
+         height = 8,
+         dpi = 300)
+
+## map
+
+region_bbox = dat %>% 
+  group_by(region) %>% 
+  summarise(lat_min = min(clat),
+            lat_max = max(clat),
+            lon_min = min(clon),
+            lon_max = max(clon)) %>% 
+  ungroup()
+
+# region_index = 3
+
+this_region_bbox = region_bbox[region_bbox$region == this_region, ]
+this_region = this_region_bbox$region
+
+map = get_stamenmap(c(
+  this_region_bbox$lon_min, 
+  this_region_bbox$lat_min, 
+  this_region_bbox$lon_max, 
+  this_region_bbox$lat_max), maptype = "terrain", zoom = 8)
+
+cluster_map = ggmap(map, darken = c(0.7, "black")) +
+  geom_point(data = clustered %>% 
+               inner_join(lake_info, by = "lake_id"), mapping = aes(x = clon, y = clat, color = class), alpha = 0.7) +
+  scale_color_viridis_d(end = 0.8) +
+  labs(title = paste("Lake color clusters: ", this_region),
+     x = "Longitude",
+     y = "Latitude",
+     color = "Cluster") +
+  facet_wrap(~method) +
+  theme(title = element_text(size = 12))
+
+cluster_map
+
+cluster_map %>% 
+  ggsave(filename = paste0("figs/", this_region, "_cluster_map.png"), 
+         width = 8,
+         height = 5,
+         dpi = 300)
+
+# merrged_map = cluster_map - doy_series_clustered +
+#   plot_layout(ncol = 1) +
+#   plot_annotation(tag_levels = "A")
+# 
+# merrged_map %>% 
+#   ggsave(filename = paste0("figs/", this_region, "_merrged_cluster_map.png"),
+#          width = 8,
+#          height = 8)
+```
+
+## DTW based clustering
+
+```{r}
+library(dtw)
+library(TSclust)
+library(dtwclust)
+library(zoo)
+
+training_dtw = training_all %>% 
+  select(-lake_id, -mean_hue, -sd_hue) %>% 
+  as.matrix()
+
+cluster_dtw <- tsclust(training_dtw, type = "h", k = 2L:4L, distance = "dtw_basic",
+                      centroid = dba, control =hierarchical_control(method = "complete"),
+                      preproc = NULL)
+
+plot(cluster_dtw[[2]], type = "d", alpha = 0.2, color = "grey") 
+
+this_clustering = cluster_dtw[[2]]
+
+lake_id = training_all %>% 
+  bind_cols(tibble(cluster_dtw = this_clustering@cluster))
+
+this_clustering_mean = this_clustering@centroid
+
+# extract the cluster validation indices
+cvi_dw <-sapply(cluster_dtw, cvi, type = "internal") 
+
+cvi_names <-rownames(cvi_dw)
+
+cvi_df <- cvi_dw %>%
+  as_data_frame() %>%
+  cbind( cvi_names) %>%
+  pivot_longer(-cvi_names, names_to="clusters", names_prefix = "V",values_to = "CVI" ) %>%
+  mutate(clusters = as.numeric(clusters) +1)
+
+ggplot(cvi_df) +
+  geom_line(aes(x=clusters, y=CVI)) +
+  facet_wrap(~cvi_names, scales="free")
+
+
+# do a final analysis for the desired number of clusters
+cluster_final <-tsclust(dtw_mat, type = "h", k = 3L, distance = "dtw_basic",
+                     centroid = dba, control =hierarchical_control(method = "complete"),
+                     preproc = NULL)
+```
+
+
+
 ## temporal changes
 
 ```{r}
