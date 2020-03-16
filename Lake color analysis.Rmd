@@ -400,6 +400,7 @@ sublakes %>%
 ## monthly dominant colors
 
 ```{r}
+require(lubridate)
 load("outputs/lake_color_three_regions_20200205.RData", verbose = T)
 
 monthly = dat %>% 
@@ -494,13 +495,11 @@ anim_save(filename = paste0(this_region, "_monthly_animation.gif"), animation = 
 load("outputs/lake_color_three_regions_20200205.RData", verbose = T)
 
 dat = dat %>%
-  filter(date >= as.Date("2014-01-01"))
+  filter(date >= as.Date("2010-01-17"))
 
 lake_info = dat %>% 
   select(clon, clat, lake_id, region) %>% 
   distinct()
-
-# remove lakes with high brightness value and low saturation
 
 
 monthly_data = dat %>% 
@@ -521,6 +520,8 @@ monthly_data = dat %>%
   }) %>% 
   ungroup() %>% 
   mutate(hue = mean_hue)
+
+save(monthly_data, file = "outputs/monthly_data.RData")
 
 month_range = tibble(
   region = c("Mackenzie Delta", "Minnesota + Wisconsin", "Tibetan Plateau"),
@@ -546,7 +547,7 @@ obs_monthly_dist %>%
   
 # this_region = "Mackenzie Delta"
 # this_region = "Minnesota + Wisconsin"
-# this_region = "Tibetan Plateau"
+this_region = "Tibetan Plateau"
 
 temp = month_range %>% filter(region == this_region)
 
@@ -564,6 +565,7 @@ training = monthly_data %>%
   select(-hue) %>% 
   spread(key = month, value = hue_norm, fill = NA) %>% 
   na.omit()
+
 
 mean_sd = training %>% 
   select(lake_id, mean_hue, sd_hue) %>% 
@@ -737,7 +739,7 @@ region_bbox = dat %>%
             lon_max = max(clon)) %>% 
   ungroup()
 
-# region_index = 3
+require(ggmap)
 
 this_region_bbox = region_bbox[region_bbox$region == this_region, ]
 this_region = this_region_bbox$region
@@ -746,7 +748,7 @@ map = get_stamenmap(c(
   this_region_bbox$lon_min, 
   this_region_bbox$lat_min, 
   this_region_bbox$lon_max, 
-  this_region_bbox$lat_max), maptype = "terrain", zoom = 8)
+  this_region_bbox$lat_max), maptype = "terrain", zoom = 9)
 
 cluster_map = ggmap(map, darken = c(0.7, "black")) +
   geom_point(data = clustered %>% 
@@ -776,55 +778,6 @@ cluster_map %>%
 #          width = 8,
 #          height = 8)
 ```
-
-## DTW based clustering
-
-```{r}
-library(dtw)
-library(TSclust)
-library(dtwclust)
-library(zoo)
-
-training_dtw = training_all %>% 
-  select(-lake_id, -mean_hue, -sd_hue) %>% 
-  as.matrix()
-
-cluster_dtw <- tsclust(training_dtw, type = "h", k = 2L:4L, distance = "dtw_basic",
-                      centroid = dba, control =hierarchical_control(method = "complete"),
-                      preproc = NULL)
-
-plot(cluster_dtw[[2]], type = "d", alpha = 0.2, color = "grey") 
-
-this_clustering = cluster_dtw[[2]]
-
-lake_id = training_all %>% 
-  bind_cols(tibble(cluster_dtw = this_clustering@cluster))
-
-this_clustering_mean = this_clustering@centroid
-
-# extract the cluster validation indices
-cvi_dw <-sapply(cluster_dtw, cvi, type = "internal") 
-
-cvi_names <-rownames(cvi_dw)
-
-cvi_df <- cvi_dw %>%
-  as_data_frame() %>%
-  cbind( cvi_names) %>%
-  pivot_longer(-cvi_names, names_to="clusters", names_prefix = "V",values_to = "CVI" ) %>%
-  mutate(clusters = as.numeric(clusters) +1)
-
-ggplot(cvi_df) +
-  geom_line(aes(x=clusters, y=CVI)) +
-  facet_wrap(~cvi_names, scales="free")
-
-
-# do a final analysis for the desired number of clusters
-cluster_final <-tsclust(dtw_mat, type = "h", k = 3L, distance = "dtw_basic",
-                     centroid = dba, control =hierarchical_control(method = "complete"),
-                     preproc = NULL)
-```
-
-
 
 ## temporal changes
 
