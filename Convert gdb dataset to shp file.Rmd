@@ -20,18 +20,41 @@ dat_grand = st_read("data/For_Xiao_Circa2015_Lake_Sample/Circa2015_Lakes_Sample.
 dat_largest200 = st_read("data/For_Xiao_Circa2015_Lake_Sample/Circa2015_Lakes_Sample.gdb", layer = "Lakes2015_01km2_natural_Largest200")
 
 dat = dat_10per_sample %>% 
-  select(Class) %>% 
+  select(Class, UniID) %>% 
   mutate(source = "dat_10per_sample") %>% 
   rbind(dat_grand %>% 
           select() %>% 
           mutate(Class = NA,
-                 source = "dat_grand")) %>% 
+                 source = "dat_grand",
+                 UniID = paste0("grand_", 1:nrow(dat_grand)))) %>% 
   rbind(dat_largest200 %>% 
-          select(Class) %>% 
+          select(Class, UniID) %>% 
           mutate(source = "dat_largest200")) %>% 
-  rename(class = Class)
+  rename(class = Class,
+         id = UniID,
+         geometry = Shape) %>% 
+  filter(st_geometry_type(geometry) == "MULTIPOLYGON")  # to remove one fiture with geometry multisurface
 
-st_write(dat, dsn = "outputs/lake_samples_12062019.shp")
+dat %>% nrow()
+dat %>% select(id) %>% st_drop_geometry() %>% distinct() %>% nrow()
+
+## add groups for batch process in GEE
+
+dat_lonlat = dat %>% 
+  st_transform(crs = 4326) %>% 
+  mutate(centroid = st_centroid(geometry),
+         lon = st_coordinates(centroid)[, 1],
+         lat = st_coordinates(centroid)[, 2]) %>% 
+  select(-centroid)
+
+dat_lonlat_group = dat_lonlat %>% 
+  mutate(lon_10grp = cut(lon, breaks = quantile(lon, probs = seq(0, 1, length.out = 11)), include.lowest = T, labels = F),
+         lat_10grp = cut(lat, breaks = quantile(lat, probs = seq(0, 1, length.out = 11)), include.lowest = T, labels = F),
+         lon_4grp = cut(lon, breaks = quantile(lon, probs = seq(0, 1, length.out = 5)), include.lowest = T, labels = F),
+         lat_4grp = cut(lat, breaks = quantile(lat, probs = seq(0, 1, length.out = 5)), include.lowest = T, labels = F)) %>% 
+  select(-class, -source, -lon, -lat)
+
+st_write(dat_lonlat_group, dsn = "outputs/lake_samples_05172020.shp")
 
 ```
 
