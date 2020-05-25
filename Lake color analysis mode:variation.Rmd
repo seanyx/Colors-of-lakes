@@ -1,0 +1,316 @@
+---
+title: "Lake color analysis mode/variation"
+author: "Xiao Yang"
+date: "5/19/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+require(tidyverse)
+require(sf)
+
+# chroma <- function(R, G, B) {
+# # require(colorscience)
+#   
+#   Xi <- 2.7689*R + 1.7517*G + 1.1302*B
+#   Yi <- 1.0000*R + 4.5907*G + 0.0601*B
+#   Zi <- 0.0565*G + 5.5943*B
+#   
+#   x <-  Xi / (Xi + Yi +  Zi)
+#   y <-  Yi / (Xi + Yi +  Zi)
+#   z <-  Zi / (Xi + Yi +  Zi)
+#   
+#   alpha <- atan2( (x - 0.33), (y - 0.33)) * 180/pi
+#   
+#   cie <- colorscience::cccie31 %>%
+#     mutate(a = atan2( (x - 0.33), (y - 0.33)) * 180/pi) %>%
+#     dplyr::filter(wlnm <= 700) %>%
+#     dplyr::filter(wlnm >= 380) %>% 
+#     select(a, wlnm) %>% 
+#     arrange(a)
+#   
+#   wl <- cie[as.vector(sapply(alpha,function(x) which.min(abs(x - cie$a)))), 'wlnm']
+#   
+#   return(wl)
+# }
+
+
+```
+
+## approx rgb from wavelength for visualization in GEE
+
+```{r}
+# method1
+colorscience::heuristic.wlnm2RGB(wavelength = seq(380, 700, length.out = 100)) %>% as_tibble() %>% 
+  mutate(color_rgb = as.character(rgb(red = R, green = G, blue = B, maxColorValue = 1))) %>% 
+  pull(color_rgb) %>% 
+  paste0(collapse = "', '")
+
+#method2
+dw2rgb = function(w) {
+  if (w >= 380 & w < 440) {
+    R = -(w - 440.) / (440. - 380.)
+    G = 0.0
+    B = 1.0
+  } else if (w >= 440 & w < 490) {
+    R = 0.0
+    G = (w - 440.) / (490. - 440.)
+    B = 1.0
+  } else if (w >= 490 & w < 510) {
+    R = 0.0
+    G = 1.0
+    B = -(w - 510.) / (510. - 490.)
+  } else if (w >= 510 & w < 580) {
+    R = (w - 510.) / (580. - 510.)
+    G = 1.0
+    B = 0.0
+  } else if (w >= 580 & w < 645) {
+    R = 1.0
+    G = -(w - 645.) / (645. - 580.)
+    B = 0.0
+  } else if (w >= 645 & w <= 780) {
+    R = 1.0
+    G = 0.0
+    B = 0.0
+  } else {
+    R = 0.0
+    G = 0.0
+    B = 0.0
+  }
+        
+  # return(rgb(R, G, B, maxColorValue = 1))
+  return(tibble(R, G, B, rgb = rgb(R, G, B, maxColorValue = 1)))
+}
+
+tibble(w = seq(380, 700, length.out = 100)) %>% 
+  group_by(w) %>% 
+  do({dw2rgb(.$w[1])}) %>% 
+  ungroup() %>% 
+  pull(rgb) %>% 
+  paste0(collapse = "', '")
+## implement this in GEE lookup table method
+# https://code.earthengine.google.com/c44243894ad2c9b0f891e4adee121e62
+```
+
+
+## Overview
+This script analyze lake color mode and standard deviation calculated from most recent 5 years of Landsat 8 data (SR, Collection 1 Tier 1, cloud <= 25, 2015-2020)
+
+
+## import data
+
+```{r}
+## load lake data 
+lakes = st_read("outputs/lake_samples_jida_05172020.shp")
+lakes = lakes %>% mutate(cd = st_centroid(geometry), clon = st_coordinates(cd)[, 1], clat = st_coordinates(cd)[, 2]) %>% select(id, clon, clat) %>% st_drop_geometry()
+
+## load lake color data
+dat = dir(path = "data/lake_color_mod_variability/", full.names = T) %>% 
+  map(read_csv, col_types = "cnnnnnnnnnnnnn") %>% 
+  reduce(bind_rows)
+
+dat %>% nrow()
+
+dat = dat %>% na.omit()
+
+dat %>% nrow()
+
+dat = dat %>% 
+  left_join(lakes, by = "id")
+
+# dat = dat %>% 
+  # mutate(dw = chroma(R = Red_mode))
+
+dat %>% nrow()
+dat %>% summary()
+```
+
+## Distribution of color
+
+```{r}
+datFil = dat %>% 
+  filter(hue_count >= 10)
+
+datFil %>% nrow()
+
+datFil %>% 
+  gather(key = "variable", value = "mode", c(hue_mode, saturation_mode, value_mode)) %>% 
+  ggplot() +
+  geom_density(aes(x = mode)) +
+  facet_wrap(~variable)
+
+## density plot
+calc_hue_density = function(hue) {
+  
+  d = density(hue, n = 512)
+  
+  hue_density = tibble(hue = d$x, density = d$y) %>% 
+    filter(hue >= 0, hue <= 1) %>% 
+    mutate(rgb_color = hsv(h = hue, s = 1, v = 1))
+  
+  return(hue_density)
+}
+
+hue_density = calc_hue_density(dat$hue_mode)
+
+all_lake_color = hue_density %>% 
+  ggplot(aes(hue, density)) + 
+  geom_segment(aes(xend = hue, yend = 0, color = rgb_color), alpha = 0.7) + 
+  geom_line(lwd = 1) + 
+  scale_color_identity() +
+  scale_x_continuous(limits = c(0, 1)) +
+  labs(
+    title = "Distribution of most frequent lake colors",
+    x = "Hue"
+  ) +
+  theme(
+    panel.background = element_blank(),
+    axis.title.y = element_blank(),
+    axis.text.y = element_blank(),
+    axis.ticks.y = element_blank()
+  )
+
+all_lake_color
+
+all_lake_color %>% ggsave(filename = "figs/all_lake_color.png", width = 6, height = 5)
+
+## maps
+
+colorPalette = datFil %>% pull(hue_mode)
+
+datFil_sf = datFil %>% 
+  st_as_sf(coords = c("clon", "clat"), crs = 4326)
+
+## create interactive map
+require(tmap)
+tmap_mode("view")
+
+tm_shape(datFil_sf) +
+    tm_dots(col = c("hue_mode"), palette = hsv(h = seq(min(colorPalette), max(colorPalette), length.out = 100), s = 1, v = 1))
+
+tm_shape(datFil_sf) +
+    tm_dots(col = c("hue_stdDev"))
+
+## save the map
+
+
+## this function calculate x and y limits under given new crs
+calculate_map_bounds = function(minlat, maxlat, minlon, maxlon, crs) {
+  line1 = st_linestring(x = matrix(c(minlon, minlat, maxlon, maxlat), byrow = T, nrow = 2), dim = "XY")
+  line2 = st_linestring(x = matrix(c(minlon, maxlat, maxlon, minlat), byrow = T, nrow = 2), dim = "XY")
+  output = st_as_sfc(list(line1, line2), crs = 4326) %>% st_transform(crs) %>% st_bbox
+  
+  return(output)
+}
+
+xylim = calculate_map_bounds(minlat = -50, maxlat = 80, minlon = -180, maxlon = 180, crs = 54030) ## say you want to plot 40N and above with polar projection EPSG:3995
+
+# rnaturalearthdata is a package in R that contains world map data, good for map background
+world = rnaturalearthdata::countries50 %>% st_as_sf %>% 
+  st_transform(crs = 54030)
+
+map_mode = datFil_sf %>% ## replace lakes as your own input of the shp file. you can import shp file using st_read()
+  st_transform(crs = 54030) %>% 
+  mutate(plotColor = hsv(hue_mode, s = 1, v = 0.8)) %>% 
+  # sample_n(2000) %>% 
+  ggplot() +
+  geom_sf(data = world, fill = "black", color = NA) +
+  geom_sf(aes(color = plotColor), size = .1, alpha = 0.6) +
+  coord_sf(crs = st_crs(54030),
+           xlim = c(xylim[1], xylim[3]),
+           ylim = c(xylim[2], xylim[4]),
+           expand = T) +
+  labs(size = "Number of instances",
+       color = "") +
+  scale_color_identity() +
+  theme(panel.grid.major = element_line(color = "white", size = 0.5),
+        axis.text.y = element_blank(),
+        axis.text.x = element_blank(),
+        line = element_blank(),
+        rect = element_blank(),
+        text = element_text(size = 14),
+        panel.grid = element_blank(),
+        legend.position = c(0.125, 0.15),
+        axis.title = element_blank())
+
+# map_mode
+
+map_mode %>% ggsave(filename = "figs/lake_mode_color_map.png", width = 10, height = 5, dpi = 300)
+
+
+map_stdDev = datFil_sf %>% ## replace lakes as your own input of the shp file. you can import shp file using st_read()
+  st_transform(crs = 54030) %>% 
+  # sample_n(2000) %>%
+  ggplot() +
+  geom_sf(data = world, fill = "black", color = NA) +
+  geom_sf(aes(color = hue_stdDev), size = .1, alpha = 0.5) +
+  coord_sf(crs = st_crs(54030),
+           xlim = c(xylim[1], xylim[3]),
+           ylim = c(xylim[2], xylim[4]),
+           expand = T) +
+  labs(size = "Number of instances",
+       color = "") +
+  scale_color_viridis_c(begin = 0.2) +
+  theme(panel.grid.major = element_line(color = "white", size = 0.5),
+        axis.text.y = element_blank(),
+        axis.text.x = element_blank(),
+        line = element_blank(),
+        rect = element_blank(),
+        text = element_text(size = 14),
+        panel.grid = element_blank(),
+        legend.position = c(0.125, 0.15),
+        axis.title = element_blank())
+
+# map_stdDev
+
+map_stdDev %>% 
+  ggsave(filename = "figs/lake_color_stdDev_map.png", width = 10, height = 5, dpi = 300)
+```
+
+## Export to GEE for visual
+```{r}
+## match lakes on GEE
+# https://code.earthengine.google.com/b57057860f122f37a80545dcff7bf8d2
+output = dat %>% 
+  select(id, hue_mode, hue_stdDev, hue_count)
+
+write_csv(output, path = "outputs/mode_color.csv")
+
+
+## upload the color w/ lake polygons
+lakes = st_read("outputs/lake_samples_jida_05172020.shp")
+lakes = lakes %>% select(id)
+output_sf = dat %>% 
+  select(hue_mode, hue_stdDev, hue_count, id) %>% 
+  mutate(color = hsv(h = hue_mode, s = 1, v = 1)) %>% 
+  left_join(lakes, by = "id") %>% 
+  st_as_sf()
+  
+
+output_sf %>% names()
+st_write(output_sf, dsn = "outputs/output_sf.shp")
+```
+
+## compare hsv to rgb conversion: GEE and R
+
+```{r}
+# https://code.earthengine.google.com/50a6689c45532bdb458b93ae809f26a2
+hsv2rgbTable = read_csv("data/hsv2rgbTable_50a6689c45532bdb458b93ae809f26a2.csv") %>% select(blue, green, red, hue) %>% 
+  mutate(rgbColor = rgb(red, green, blue, maxColorValue = 1))
+
+merged = tibble(hue = seq(0, 1, by = 0.001)) %>% 
+  mutate(rgb_hsv = hsv(h = hue, s = 1, v = 1)) %>% 
+  left_join(hsv2rgbTable, by = "hue")
+  
+
+merged %>% ggplot + geom_point(aes(x = 1:1001, y = 1, color = rgbColor)) +
+  geom_point(aes(x = 1:1001, y = 2, color = rgb_hsv)) + scale_color_identity() +
+  ylim (-1, 4)
+```
+
+
+## plot the color on the chromaticity diagram
+
+
