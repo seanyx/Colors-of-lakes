@@ -1,0 +1,2038 @@
+---
+title: "Lake color analysis final"
+author: "Xiao Yang"
+date: "4/20/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+require(tidyverse)
+require(sf)
+
+chroma <- function(R, G, B) {
+  require(colorscience)
+
+  Xi <- 2.7689*R + 1.7517*G + 1.1302*B
+  Yi <- 1.0000*R + 4.5907*G + 0.0601*B
+  Zi <- 0.0565*G + 5.5943*B
+
+  x <-  Xi / (Xi + Yi +  Zi)
+  y <-  Yi / (Xi + Yi +  Zi)
+  z <-  Zi / (Xi + Yi +  Zi)
+
+  alpha <- atan2( (x - 0.33), (y - 0.33)) * 180/pi
+
+  cie <- colorscience::cccie31 %>%
+    mutate(a = atan2( (x - 0.33), (y - 0.33)) * 180/pi) %>%
+    dplyr::filter(wlnm <= 700) %>%
+    dplyr::filter(wlnm >= 380) %>%
+    dplyr::select(a, wlnm) %>%
+    arrange(a)
+
+  wl <- cie[as.vector(sapply(alpha,function(x) which.min(abs(x - cie$a)))), 'wlnm']
+
+  return(wl)
+}
+chroma2 <- function(R, G, B) {
+  # same as chroma but using interpolation instead of nearest neighbor to assign dw from the lookup table
+  require(colorscience)
+
+  Xi <- 2.7689*R + 1.7517*G + 1.1302*B
+  Yi <- 1.0000*R + 4.5907*G + 0.0601*B
+  Zi <- 0.0565*G + 5.5943*B
+
+  x <-  Xi / (Xi + Yi +  Zi)
+  y <-  Yi / (Xi + Yi +  Zi)
+  z <-  Zi / (Xi + Yi +  Zi)
+
+  alpha <- atan2((x - 0.33), (y - 0.33)) * 180/pi
+
+  cie <- colorscience::cccie31 %>%
+    mutate(a = atan2( (x - 0.33), (y - 0.33)) * 180/pi) %>%
+    dplyr::filter(wlnm <= 700) %>%
+    dplyr::filter(wlnm >= 380) %>%
+    dplyr::select(a, wlnm) %>%
+    arrange(a)
+
+  wl = approx(x = cie$a, y = cie$wlnm, xout = alpha, method = "linear")$y
+  # wl <- cie[as.vector(sapply(alpha,function(x) which.min(abs(x - cie$a)))), 'wlnm']
+
+  return(wl)
+}
+chromaLehmann = function(uB, B, G, R) {
+  X = 11.053 * uB + 6.950 * B + 51.135 * G + 34.457 * R
+  Y = 1.320 * uB + 21.053 * B + 66.023 * G + 18.034 * R
+  Z = 58.038 * uB + 34.931 * B + 2.606 * G + 0.016 * R
+  
+  XYZ = X + Y + Z
+  x = X / XYZ
+  y = Y / XYZ
+  z = Z / XYZ
+  
+  #  %% (2 * pi))
+  alpha0 = (atan2(x - 1 / 3, y - 1/3)) * 180 / pi
+  
+  ## angle shift (hue angle in *** and *** have different starting location and range)
+  alpha = 270 - (alpha0  + 180)
+  a = alpha / 100
+  # correction only for 37º to 230º
+  deltaAlpha = -52.16 * a^5 + 373.81 * a^4 - 981.83 * a^3 + 1134.19 * a^2 - 533.61 * a + 76.72
+  deltaS = -0.0099 * a^5 + 0.1199 * a^4 - 0.4594 * a^3 + 0.7515 * a^2 - 0.5095 * a + 0.1222
+  alphaCorrected = alpha + deltaAlpha
+  
+  alpha = 270 - alphaCorrected - 180 ## shift back to -180 to 180 range (cw from neg y axis)
+  
+  oneThird = 1 / 3
+  
+  s = sqrt((x - oneThird)^2 + (y - oneThird)^2)
+  s = s + deltaS
+  
+  cie <- colorscience::cccie31 %>%
+    mutate(a = atan2((x - oneThird), (y - oneThird)) * 180/pi,
+           d = sqrt((x - oneThird)^2 + (y - oneThird)^2)) %>%
+    dplyr::filter(wlnm <= 700) %>%
+    dplyr::filter(wlnm >= 380) %>%
+    select(a, wlnm) %>%
+    arrange(a)
+
+  wl = approx(x = cie$a, y = cie$wlnm, xout = alpha, method = "linear")$y
+  d = approx(x = cie$a, y = cie$d, xout = alpha, method = "linear")$y
+  
+  tibble(alphaXPosUncorrected = a * 100, alphaXPos = alphaCorrected, deltaAlpha, alphaYNeg = alpha, s, wl, x, y, sp = s / d)
+}
+
+
+### functions to assign FUI level and color given dw value
+get_FUI = function() {
+  thresholds = c(470, 475, 480, 485, 489, 495, 509, 530, 549, 559, 564, 567, 568, 569, 570, 571, 573, 575, 577, 579, 581, 600)
+  levels = paste("FUI", 1:21)
+  fui_colors = c(
+    "#2158bc", "#316dc5", "#327cbb", "#4b80a0", "#568f96", "#6d9298", "#698c86", 
+    "#759e72", "#7ba654", "#7dae38", "#94b660","#94b660", "#a5bc76", "#aab86d", 
+    "#adb55f", "#a8a965", "#ae9f5c", "#b3a053", "#af8a44", "#a46905", "#9f4d04")
+  
+  return(list(thresholds = thresholds, color_table = tibble(levels, fui_colors)))
+}
+dw2FUI = function(dw) {
+  FUI_table = get_FUI()
+  color_rgb = tibble(dw = dw) %>% 
+    mutate(fui = cut(dw, breaks = FUI_table[[1]], labels = FUI_table[[2]]$fui_colors)) %>% 
+    pull(fui) %>% 
+    as.character()
+  
+  return(color_rgb)
+}
+```
+
+## Import data
+
+```{r}
+datDir = dir("~/Google_Drive_morphologee1/Colors of lakes", full.names = T)
+
+## raw data
+
+
+dat_meta = datDir %>% 
+  map(function(x) {
+    y = read_csv(x)
+    yfil = y %>% select(id, LANDSAT_ID, dwLehmann) %>% na.omit()
+    return(yfil)}) %>% 
+  reduce(rbind)
+
+distinctObs = dat_meta %>% filter(!is.na(dwLehmann)) %>% distinct
+distinctObs %>% nrow()
+distinctObs %>% select(id) %>% distinct %>% nrow()
+distinctObs %>% select(LANDSAT_ID) %>% distinct() %>% nrow()
+
+
+## data cleaning
+
+
+dat = datDir %>% 
+  map(read_csv) %>% 
+  reduce(rbind)
+
+datFil = dat %>% 
+  filter(fmask_cloud == 0, 
+         fmask_snowIce == 0,
+         Red >= 0, Red <= 1,
+         Green >= 0, Green <= 1,
+         Blue >= 0, Blue <= 1,
+         uBlue >= 0, uBlue <= 1,
+         dsweNone0 <= 2) %>% 
+  select(id, uBlue, Blue, Green, Red, date, dw, dwLehmann, LANDSAT_ID, mean_2m_air_temperature)
+
+datFil = datFil %>% 
+  mutate(dwPost = chroma2(Red, Green, Blue),
+         dwLehmannPost = chromaLehmann(uBlue, Blue, Green, Red)$wl,
+         s = chromaLehmann(uBlue, Blue, Green, Red)$s,
+         sp = chromaLehmann(uBlue, Blue, Green, Red)$sp,
+         brightness = sqrt((Red^2 + Green^2 + Blue^2) / 3))
+
+datFil = datFil %>% filter(!is.na(dwLehmann)) %>% select(-dwPost, -dwLehmannPost, -dw, -sp) %>% distinct
+
+save(datFil, file = "outputs/lake_color_per_img_c2d77db60e960bbcd721fb580fa05896.RData")
+
+load("outputs/lake_color_per_img_c2d77db60e960bbcd721fb580fa05896.RData", verbose = T)
+print("how many non-null dwLehmann values from how many lakes?")
+distinctObs = datFil %>% select(id, LANDSAT_ID, dwLehmann) %>% filter(!is.na(dwLehmann)) %>% distinct
+distinctObs %>% nrow()
+distinctObs %>% select(id) %>% distinct %>% nrow()
+distinctObs %>% select(LANDSAT_ID) %>% distinct() %>% nrow()
+remove(distinctObs)
+
+# Export for GEE app
+raw_color = datFil %>% dplyr::select(id, dwLehmann, LANDSAT_ID, date, s, brightness) %>% 
+  na.omit() %>% 
+  mutate(doy = lubridate::yday(date)) %>% 
+  mutate(dwLehmann = as.integer(dwLehmann),
+         brightness1000 = as.integer(brightness * 1000),
+         s1000 = as.integer(s * 1000),
+         doy = as.integer(doy)) %>% 
+  dplyr::select(-s, -brightness)
+
+write_csv(raw_color, file = "outputs/raw_color_c2d77db60e960bbcd721fb580fa05896.csv")
+```
+
+## Modal color
+
+### Calculate modal color for each lake
+
+```{r}
+require(diptest)
+load("outputs/lake_color_per_img_c2d77db60e960bbcd721fb580fa05896.RData", verbose = T)
+
+datFil %>% dplyr::select(id) %>% distinct() ## 147,025 lakes
+
+obs = datFil %>% 
+  filter(!is.na(dwLehmann)) %>% 
+  group_by(id) %>% 
+  count() %>% 
+  ungroup()
+
+obs %>% ggplot() + geom_density(aes(n), fill = "grey") +
+  labs(x = "No. of observation", y = "") + geom_vline(data = tibble(x = c(20, 40)), aes(xintercept = x), color = "red") + ggsave(filename = "figs/obs_count_distribution.png", width = 5, height = 4)
+
+dat0 = datFil %>% 
+  dplyr::select(id, dwLehmann) %>% 
+  na.omit() %>% 
+  group_by(id) %>% 
+  mutate(n = n()) %>% 
+  ungroup() %>% 
+  filter(n >= 20)
+
+dat0 %>% dplyr::select(id) %>% distinct() %>% nrow()
+
+datMode = dat0 %>% 
+  group_by(id) %>% 
+  do({
+    dat = .
+    dwValues = dat %>% pull(dwLehmann)
+    dip = dwValues %>% dip.test()
+    d = dwValues %>% density()
+    mode = d$x[which.max(d$y)][1]
+      
+    dip[1:3] %>% as_tibble() %>% 
+      mutate(mode = mode, bw = d$bw, 
+             dwStd = sd(dwValues, na.rm = T),
+             interQ = (quantile(dwValues, probs = 0.75) - quantile(dwValues, probs = 0.25)) %>% as.numeric())
+  }) %>% 
+  ungroup()
+
+summary(datMode)
+datMode %>% dplyr::select(id) %>% distinct ## 110,160 lakes (after removing duplication: 109,824)
+
+save(datMode, file = "outputs/dat_just_modal_color.RData") ## this data will be used for visualization of lake color distribution and mapping, further matching to add additional metadata will decrease the available lake count
+
+## determine unimodal lakes
+datMode = datMode %>% 
+  mutate(unimodal = factor(p.value >= 0.05, levels = c(T, F), labels = c("Unimodal", "Non-unimodal")))
+### Bonferroni correction results in much fewer non-unimodal lakes
+datMode %>% 
+  mutate(unimodal = factor(p.value >= 0.05 / nrow(datMode), levels = c(T, F), labels = c("Unimodal", "Non-unimodal"))) %>% 
+  summary()
+
+## add lake mean water occ
+meanLakeOcc = dir(path = "data/meanLakeOcc/", pattern = ".csv", include.dirs = T, full.names = T) %>% 
+  map(read_csv, col_types = "cn") %>% 
+  reduce(bind_rows)
+
+summary(meanLakeOcc)
+
+meanLakeOcc %>% dplyr::select(id) %>% distinct ## 150,559 lakes - 368 lakes
+
+datMode = datMode %>% 
+  left_join(meanLakeOcc, by = "id") %>% 
+  na.omit()
+
+datMode %>% dplyr::select(id) %>% distinct ## 110,090 lakes (after romoving duplicates: 109,754)
+
+write_csv(datMode, path = "outputs/datMode20_c2d77db60e960bbcd721fb580fa05896.csv")
+save(datMode, file = "outputs/datMode20_c2d77db60e960bbcd721fb580fa05896.RData")
+```
+
+
+
+## Color distribution (figure 1)
+
+```{r}
+load("outputs/dat_just_modal_color.RData", verbose = T)
+
+## density plot
+
+### label values
+d = density(datMode$mode)
+max_mode = tibble(x = d$x, y = d$y) %>% 
+  mutate(grp = x < 529) %>% 
+  group_by(grp) %>% 
+  summarise(ymax = max(y),
+            x = x[which(y == ymax)]) %>% 
+  ungroup() %>% 
+  rename(y = ymax) %>% 
+  select(-grp)
+
+min_mode = tibble(x = d$x, y = d$y) %>% 
+  filter(x >= 495 & x <= 574) %>% 
+  slice_min(order_by = y)
+
+mode_to_label = bind_rows(max_mode, min_mode)
+
+### ggplot density plot
+
+dist_mod = datMode %>% ggplot() +
+  geom_vline(data = mode_to_label, aes(xintercept = x), color = "darkgrey") +
+  ggridges::stat_density_ridges(geom = "density_ridges_gradient", aes(x = mode, y = 0, fill = stat(x)), color = NA, show.legend = F, bandwidth = 3, scale = 1) +
+  # geom_histogram(aes(x = mode, y = stat(density)), binwidth = 3, fill = NA, color = "grey40") +
+  scale_fill_gradientn(limits = c(450, 600), colours = dw2FUI(450:600), na.value='#FFFFFF00') +
+  scale_x_continuous(breaks = seq(470, 600, by = 10), limits = c(470, 600), sec.axis = dup_axis(name = NULL, breaks = mode_to_label$x, labels = paste(format(mode_to_label$x, digits = 2), "nm"))) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.05))) +
+  labs(x = "Lake color (modal dominant wavelength: nm)",
+       y = "Probability") +
+  theme_bw() +
+  theme(
+    # axis.title.y = element_blank(),
+    # axis.text.y = element_blank(),
+    axis.text.x = element_text(angle = 0),
+    axis.ticks.y = element_blank(),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor.y = element_blank(),
+    panel.background = element_blank())
+
+dist_mod
+
+dist_mod %>% ggsave(filename = "figs/dist_mod_FUI_color.png",
+                    width = 5,
+                    height = 3)
+```
+
+## Color distribution map (figure 2)
+
+```{r}
+load("outputs/dat_just_modal_color.RData", verbose = T)
+lake_coords = st_read("outputs/lakeSample_Dp.geojson") %>% 
+  distinct(.keep_all = T)
+
+
+lake_coords %>% select(id) %>% st_drop_geometry() %>% distinct() %>% nrow()
+lakes_with_multiple_dp = lake_coords %>% select(id) %>% st_drop_geometry() %>% count(id) %>% filter(n > 1) %>% as_tibble() %>% 
+  left_join(lake_coords, by = "id") %>% st_as_sf
+mapview::mapview(lakes_with_multiple_dp)
+
+gridsize_x = 3
+gridsize_y = 2
+
+grid = st_make_grid(
+  x = st_bbox(c(xmin = -180, xmax = 180, ymin = -60, ymax = 90), crs = st_crs(4326)),
+  cellsize = c(gridsize_x, gridsize_y),
+  what = "polygons"
+)
+
+grid = grid %>% st_as_sf() %>% 
+  mutate(index = 1:length(grid))
+
+grid_color = grid %>% 
+  st_join(datMode %>% left_join(lake_coords %>% select(id)) %>% st_as_sf, left = F) %>% 
+  mutate(x = st_centroid(x))
+
+grid_color_stats_raw = grid_color %>% 
+  group_by(index) %>% 
+  summarise(
+    median_mode = median(mode),
+    sd_mode = sd(mode),
+    median_dwStd = median(dwStd),
+    sd_dwStd = sd(dwStd),
+    n = n(),
+    median_nobs = median(nobs)
+  ) %>% 
+  ungroup()
+
+save(grid_color_stats_raw, file = "outputs/grid_color_stats_raw.RData")
+
+countries = st_as_sf(rnaturalearth::countries110) %>% filter(region_un != "Antarctica")
+crs_string = "+proj=robin +lon_0=0 +datum=WGS84 +units=m +no_defs" ## Robinson PROJ WKT
+```
+
+### Figure S-data-availability-map
+
+```{r}
+## figure S-data-availability-map
+load("outputs/grid_color_stats_raw.RData", verbose = T)
+countries = st_as_sf(rnaturalearth::countries110) %>% filter(region_un != "Antarctica")
+crs_string = "+proj=robin +lon_0=0 +datum=WGS84 +units=m +no_defs" ## Robinson PROJ WKT
+
+global_dist_nobs = ggplot() + 
+  geom_sf(data = countries %>% st_transform(crs = crs_string), fill = "grey60", color = NA) +
+  geom_sf(data = grid_color_stats_raw %>% st_transform(crs = crs_string), aes(color = median_nobs, size = n), alpha = 0.8) + 
+  coord_sf(crs = crs_string, expand = expansion(0, 0)) +
+  scale_color_continuous(trans = "log10", type = "viridis", guide = guide_colorbar(title.position = "top")) +
+  scale_size_area(max_size = 1.5, guide = guide_legend(title.position = "top")) +
+  labs(color = "Median no. of color measurements per lake", size = "Lake count") +
+  theme_dark() +
+  theme(legend.position = "bottom",
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank())
+
+global_dist_nobs
+
+global_dist_nobs %>% ggsave(filename = "figs/global_dist_nobs.png",
+                       width = 7,
+                       height = 4)
+```
+
+### Figure 2
+
+```{r}
+## Figure 2
+load("outputs/grid_color_stats_raw.RData", verbose = T)
+countries = st_as_sf(rnaturalearth::countries110) %>% filter(region_un != "Antarctica")
+crs_string = "+proj=robin +lon_0=0 +datum=WGS84 +units=m +no_defs" ## Robinson PROJ WKT
+
+global_dist_mode = ggplot() + 
+  geom_sf(data = countries %>% st_transform(crs = crs_string), fill = "grey40", color = NA) +
+  geom_sf(data = grid_color_stats_raw %>% filter(n > 1) %>% st_transform(crs = crs_string), aes(color = median_mode, size = sd_mode), alpha = 0.8) + 
+  geom_sf(data = grid_color_stats_raw %>% filter(n == 1) %>% st_transform(crs = crs_string), aes(color = median_mode), alpha = 0.8, size = 0.8, pch = 1) + 
+  coord_sf(crs = crs_string, expand = expansion(0, 0)) +
+  scale_color_gradientn(limits = c(480, 588), colours = dw2FUI(480:588), na.value='#FFFFFF00',
+                        guide = guide_colorbar(title.position = "top", title.hjust = 0)) +
+  scale_size_area(max_size = 2,
+                  guide = guide_legend(title.position = "top", title.hjust = 0)) +
+  labs(color = "Median lake color (nm)", size = "Spatial color variability (nm)") +
+  theme_dark() +
+  theme(legend.position = "bottom",
+        panel.border = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        panel.background = element_rect(fill = "grey10"))
+
+global_dist_mode
+
+global_dist_mode %>% ggsave(filename = "figs/fig2_global_dist_mode_Fui_color.png",
+                       width = 7.5,
+                       height = 4.5,
+                       dpi = "retina")
+```
+
+## zoomed in map 
+
+### showing spatial color variability (figure 3)
+
+```{r}
+getUTMProj = function(lon, lat) {
+  # // see https://apollomapping.com/blog/gtm-finding-a-utm-zone-number-easily and
+  # // https://sis.apache.org/faq.html
+  utmCode = ceiling((lon + 180) / 6)
+  if (lat >= 0) {
+    # output = sprintf(fmt = "EPSG:326%2d", utmCode)
+    # output = sprintf(fmt = "326%2d", utmCode) %>% as.integer()
+    output = 32600 + utmCode
+  } else if (lat < 0) {
+    # output = sprintf(fmt = "EPSG:327%2d", utmCode)
+    # output = sprintf(fmt = "327%2d", utmCode) %>% as.integer()
+    output = 32700 + utmCode
+  }
+  return(output)
+}
+
+grid_color_mode %>% mapview::mapview(zcol = "median")
+lakes = st_read("outputs/lake_samples_jida_05172020.shp")
+dps = st_read("outputs/lakeSample_Dp.geojson")
+
+ids = c(
+  7587,
+  7696, # 
+  7695,
+  7809,
+  6269
+  )
+
+ids = c(7587, 7586)
+
+grid_color_fil = grid_color %>% filter(index %in% ids)
+
+coords_centroid = grid_color_fil %>% st_union() %>% st_centroid() %>% st_coordinates()
+crs = getUTMProj(coords_centroid[1], coords_centroid[2])
+
+grid_color_fil = grid_color_fil %>% 
+  st_drop_geometry() %>% 
+  as_tibble() %>% 
+  select(mode, id)
+
+grid_lakes =  grid_color_fil %>% 
+  left_join(lakes %>% select(id) %>% as_tibble(), by = "id") %>% 
+  st_as_sf %>% 
+  st_transform(crs = crs)
+
+grid_lake_dp = grid_color_fil %>% 
+  left_join(dps %>% select(id) %>% as_tibble(), by = "id") %>% 
+  st_as_sf %>% 
+  st_transform(crs = crs)
+
+mapview::mapview(grid_lakes) + mapview::mapview(grid_lake_dp, zcol = "mode")
+
+bbox = grid_lake_dp %>% st_bbox() %>% st_as_sfc %>% densify() %>% st_transform(crs = crs)
+coastline = rnaturalearthdata::coastline50 %>% st_as_sf %>% 
+  densify() %>% 
+  st_transform(crs = crs) %>% 
+  st_intersection(bbox %>% st_buffer(10000))
+
+zoomIn = ggplot() + 
+  geom_sf(data = coastline, color = "grey90") +
+  geom_sf(data = grid_lakes, aes(fill = mode), color = NA) +
+  geom_sf(data = bbox, color = "red", fill = NA) +
+  coord_sf(expand = expansion()) +
+  scale_fill_gradientn(limits = c(472, 588), colours = dw2FUI(472:588), na.value='#FFFFFF00') +
+  theme_dark() +
+  theme(
+    legend.position = "bottom", 
+    legend.direction = "horizontal", 
+    text = element_text(size = 10),
+    panel.background = element_rect(fill = "grey10")) +
+  labs(fill = "Modal dominant wavelength (nm)")
+
+zoomIn
+
+zoomIn %>% ggsave(filename = paste("figs/zoomIn", paste(ids %>% format(digits = 1), collapse = "_"), ".png", sep = "_"),
+                  width = 5,
+                  height = 5)
+```
+
+### zoomed in map customized area R1
+
+```{r}
+require(raster)
+require(tidyverse)
+require(sf)
+lakes = st_read("outputs/lake_samples_jida_05172020.shp")
+load("outputs/modelInput_20210302.RData", verbose = T)
+latrange = c(67, 67.5)
+lonrange = c(-101, -100)
+
+lake_color_fil = modelInput %>% 
+  filter(lat >= latrange[1] & lat <= latrange[2],
+         lon >= lonrange[1] & lon <= lonrange[2]) %>% 
+  dplyr::select(id, mode) %>% 
+  left_join(lakes %>% dplyr::select(id), by = "id") %>% 
+  st_as_sf()
+
+## add dem layer
+# https://code.earthengine.google.com/c55fcf0d9848cda5bb2daad072abcea2
+dem = raster("figs/figure3background_ba77763fe238593c6476db4f8b389a07.tif")
+
+dem = dem %>% crop(x = ., y = extent(c(lonrange, latrange)))
+
+# https://www.r-bloggers.com/2018/08/how-to-quickly-enrich-a-map-with-natural-and-anthropic-details/
+dem.m = rasterToPoints(dem) %>% as.tibble() %>% 
+  rename_with(.fn = function(x) {return(c("x", "y", "z"))})
+
+dem.m %>% ggplot() + geom_raster(aes(x = x, y = y, fill = z)) +
+  scale_fill_viridis_c() +
+  coord_equal()
+
+slope = terrain(dem, opt = 'slope')
+aspect = terrain(dem, opt = 'aspect')
+hillshade = hillShade(slope, aspect, 40, 270)
+
+hill.m = rasterToPoints(hillshade) %>% as_tibble() %>% 
+  rename_with(.fn = function(x) {return(c("x", "y", "z"))})
+
+hill.m %>% 
+  ggplot() + 
+  geom_raster(aes(x = x, y = y, fill = z)) +
+  scale_fill_gradientn(colors = grey.colors(n = 100)) +
+  coord_equal()
+
+# 1. crop image with latrange and lonrange
+# 2. export as png
+# 3. import as png to set as ggplot background
+
+bk = ggplot(data = hill.m) +
+  geom_raster(aes(x = x, y = y, fill = z), show.legend = F) +
+  geom_sf(data = lake_color_fil, fill = NA, color = NA) +
+  scale_fill_gradientn(colors = grey.colors(n = 100, end = 0.5)) +
+  coord_sf(expand = FALSE, xlim = lonrange, ylim = latrange) +
+  theme_void()
+
+bk
+
+bkgrop = ggplotGrob(bk)
+bkpanel = gtable::gtable_filter(bkgrop, "panel")
+
+fig3_dembk = lake_color_fil %>% 
+  ggplot() +
+  annotation_custom(bkpanel, xmin=-Inf, xmax=Inf, ymin=-Inf, ymax=Inf) +
+  geom_sf(aes(fill = mode), color = NA, show.legend = F) +
+  scale_fill_gradientn(limits = c(472, 588), colours = dw2FUI(472:588), na.value='#FFFFFF00') +
+  coord_sf(expand = FALSE, xlim = lonrange, ylim = latrange, clip = "on") +
+  ggspatial::annotation_scale()
+
+fig3_dembk
+
+fig3_dembk %>% 
+  ggsave(filename = "figs/fig3_dembk_r1.png",
+         width = 3,
+         height = 4)
+```
+
+### zoomed in map customized area R2
+
+```{r}
+require(raster)
+require(tidyverse)
+require(sf)
+lakes = st_read("outputs/lake_samples_jida_05172020.shp")
+load("outputs/modelInput_20210302.RData", verbose = T)
+latrange = c(73.1113, 73.3845)
+lonrange = c(124.5641, 125.6297)
+
+lake_color_fil = modelInput %>% 
+  filter(lat >= latrange[1] & lat <= latrange[2],
+         lon >= lonrange[1] & lon <= lonrange[2]) %>% 
+  dplyr::select(id, mode) %>% 
+  left_join(lakes %>% dplyr::select(id), by = "id") %>% 
+  st_as_sf()
+
+## add dem layer
+# https://code.earthengine.google.com/c55fcf0d9848cda5bb2daad072abcea2
+dem = raster("figs/figure3background_f7afa23f002c5756c27619c95c00613b.tif")
+
+dem = dem %>% crop(x = ., y = extent(c(lonrange, latrange)))
+
+# https://www.r-bloggers.com/2018/08/how-to-quickly-enrich-a-map-with-natural-and-anthropic-details/
+dem.m = rasterToPoints(dem) %>% as.tibble() %>% 
+  rename_with(.fn = function(x) {return(c("x", "y", "z"))})
+
+dem.m %>% ggplot() + geom_raster(aes(x = x, y = y, fill = z)) +
+  scale_fill_viridis_c() +
+  coord_equal()
+
+slope = terrain(dem, opt = 'slope')
+aspect = terrain(dem, opt = 'aspect')
+hillshade = hillShade(slope, aspect, 40, 270)
+
+hill.m = rasterToPoints(hillshade) %>% as_tibble() %>% 
+  rename_with(.fn = function(x) {return(c("x", "y", "z"))})
+
+hill.m %>% 
+  ggplot() + 
+  geom_raster(aes(x = x, y = y, fill = z)) +
+  scale_fill_gradientn(colors = grey.colors(n = 100)) +
+  coord_equal()
+
+# 1. crop image with latrange and lonrange
+# 2. export as png
+# 3. import as png to set as ggplot background
+
+bk = ggplot(data = hill.m) +
+  geom_raster(aes(x = x, y = y, fill = z), show.legend = F) +
+  geom_sf(data = lake_color_fil, fill = NA, color = NA) +
+  scale_fill_gradientn(colors = grey.colors(n = 100, end = 0.5)) +
+  coord_sf(expand = FALSE, xlim = lonrange, ylim = latrange) +
+  theme_void()
+
+bk
+
+bkgrop = ggplotGrob(bk)
+bkpanel = gtable::gtable_filter(bkgrop, "panel")
+
+fig3_dembk = lake_color_fil %>% 
+  ggplot() +
+  annotation_custom(bkpanel, xmin=-Inf, xmax=Inf, ymin=-Inf, ymax=Inf) +
+  geom_sf(aes(fill = mode), color = NA, show.legend = F) +
+  scale_fill_gradientn(limits = c(472, 588), colours = dw2FUI(472:588), na.value='#FFFFFF00') +
+  coord_sf(expand = FALSE, xlim = lonrange, ylim = latrange, clip = "on") +
+  ggspatial::annotation_scale()
+
+fig3_dembk
+
+fig3_dembk %>% 
+  ggsave(filename = "figs/fig3_dembk_r2.png",
+         width = 4,
+         height = 6)
+```
+
+
+
+
+
+
+
+## Merge attributes, excluding landcover and hydrolake attributes
+
+### climate variables
+
+```{r}
+era5lake = dir("data/lakeTempPrecip", full.names = T) %>% 
+  map(read_csv, col_types = "cnnnn") %>% 
+  reduce(bind_rows)
+```
+
+### lake physical parameters
+
+```{r}
+lakeMeta = read_csv("outputs/lake_meta_v2.csv", col_types = "iccnnc")
+```
+
+```{r}
+# load("outputs/datModeGroup_assigned_c2d77db60e960bbcd721fb580fa05896.RData", verbose = T)
+load("outputs/datMode20_c2d77db60e960bbcd721fb580fa05896.RData", verbose = T)
+
+datMode %>% nrow() # 109,754 lakes
+
+## climate data
+merged = datMode %>% inner_join(era5lake, by = "id")
+nrow(merged) # 109,754 lakes
+
+## physical parameters
+merged = merged %>% inner_join(lakeMeta, by = "id")
+merged = merged %>% filter(!is.na(class))
+nrow(merged) # 103,318 lakes (6,436 lakes don't have class and volumn values)
+
+# write_csv(merged, path = "outputs/merged_predictor_lake_color_data_02182021.csv")
+
+modelInput = merged
+
+# save(modelInput, file = "outputs/modelInput_20210218.RData")
+
+lakeElev = read_csv("data/lake_center_elevation_038ec249d09358b3715e0f02c89e6d98.csv", col_types = "cnn")
+lakeMetric = read_csv("data/lakeMetrics_022b85da71a43d98e7c2cea22c6c0c66.csv")
+
+lakeElev = lakeElev %>% 
+  group_by(id) %>% 
+  summarise(elevation = mean(dem),
+            dist2shore = mean(distance)) %>% 
+  ungroup
+
+modelInput = modelInput %>% 
+  left_join(lakeElev, by = "id") %>% 
+  left_join(lakeMetric, by = "id")
+
+modelInput = modelInput %>% filter(!is.na(elevation))
+
+nrow(modelInput) ## 100,452 lakes
+
+save(modelInput, file = "outputs/modelInput_20210719.RData")
+```
+
+### seasonal climate variables
+
+```{r, eval=FALSE}
+load("outputs/modelInput_20210719.RData", verbose = T)
+
+skimr::skim(modelInput)
+summary(modelInput)
+
+seasonal_climate = dir(path = "data/LakeTempPrecip_min_d6fed587b373455c77b5f31a9e16c346", pattern = ".csv", full.names = T, include.dirs = T) %>% 
+  map(read_csv, col_type = paste0("c", paste(rep("n", 20), collapse = ""))) %>% 
+  reduce(bind_rows)
+
+## adjust for seasonality difference between n and s hemisphere
+
+### get lake latitude
+lake_coords = st_read("outputs/lakeSample_Dp.geojson")
+lake_coords = lake_coords %>% select(id) %>% 
+  mutate(lon = st_coordinates(geometry)[, 1],
+         lat = st_coordinates(geometry)[, 2]) %>% 
+  st_drop_geometry() %>% as_tibble() %>% distinct()
+
+### adjust seasons
+seasonal_climate = seasonal_climate %>% 
+  select(-mean_2m_air_temperature_mean, -mean_2m_air_temperature_stdDev, -total_precipitation_mean, -total_precipitation_stdDev) %>% 
+  select(ends_with("mean"), id)
+
+seasonal_climate_adj = seasonal_climate %>% 
+  inner_join(lake_coords %>% filter(lat >= 0)) %>% 
+  bind_rows(seasonal_climate %>% 
+              inner_join(lake_coords %>% filter(lat < 0)) %>% 
+              rename(
+                spring_temperature_mean = fall_temperature_mean,
+                summer_temperature_mean = winter_temperature_mean,
+                fall_temperature_mean = spring_temperature_mean,
+                winter_temperature_mean = summer_temperature_mean,
+                spring_total_precipitation_mean = fall_total_precipitation_mean,
+                summer_total_precipitation_mean = winter_total_precipitation_mean,
+                fall_total_precipitation_mean = spring_total_precipitation_mean,
+                winter_total_precipitation_mean = summer_total_precipitation_mean
+                     ))
+
+modelInput = modelInput %>% 
+  left_join(seasonal_climate_adj, by = "id") %>% 
+  distinct()
+
+save(modelInput, file = "outputs/modelInput_20210719.RData")
+```
+
+
+## model color
+
+### descriptive stats
+
+```{r}
+load("outputs/modelInput_20210302.RData", verbose = T)
+
+## of all warm lakes, what percentage is blue
+modelInput %>% mutate(temp_grp = summer_temperature_mean < 18.56 + 273.15) %>% 
+  group_by(temp_grp) %>% 
+  summarise(blue_ratio = sum(mode <= 526) / n()) %>% 
+  ungroup()
+
+## of all blue lakes, what percentage experience ice cover
+modelInput %>% mutate(color_grp = mode <=526) %>% 
+  group_by(color_grp) %>% 
+  summarise(ice_cover_ratio = sum(winter_temperature_mean <= 273.15) / n()) %>% 
+  ungroup()
+
+## of ice covered lakes, what percentage is blue
+modelInput %>% mutate(ice_cover = winter_temperature_mean <= 273.15) %>% 
+  group_by(ice_cover) %>% 
+  summarise(blue_ratio = sum(mode <= 526) / n()) %>% 
+  ungroup()
+```
+
+## tree model
+
+```{r}
+require(rpart)
+require(partykit)
+require(tidyverse)
+load("outputs/modelInput_20210719.RData", verbose = T)
+
+model_input = modelInput %>% 
+  mutate(class = as.factor(class)) %>% 
+  transmute(
+    mode,
+    dwStd,
+    lakeMeanOcc,
+    # mean_2m_air_temperature_mean,
+    winter_temperature_mean,
+    # spring_temperature_mean,
+    summer_temperature_mean,
+    # fall_temperature_mean,
+    total_precipitation_mean,
+    spring_total_precipitation_mean,
+    # class,
+    depthMean,
+    # volumn,
+    polygonArea,
+    # dist2shore,
+    elevation,
+    total_precipitation_stdDev,
+    mean_2m_air_temperature_stdDev
+    # lon,
+    # lat
+    )
+
+model_input %>% 
+  cor() %>% 
+  corrplot::corrplot(.)
+
+
+require(party)
+
+modelInput = modelInput %>% 
+  mutate(winter_temperature_mean = winter_temperature_mean - 273.15,
+         summer_temperature_mean = summer_temperature_mean - 273.15,
+         )
+
+model_input = modelInput %>% 
+  mutate(class = as.factor(class)) %>% 
+  transmute(
+    mode,
+    # dwStd,
+    lakeMeanOcc,
+    # mean_2m_air_temperature_mean,
+    winter_temperature_mean,
+    # spring_temperature_mean,
+    summer_temperature_mean,
+    # fall_temperature_mean,
+    total_precipitation_mean,
+    spring_total_precipitation_mean,
+    # class,
+    depthMean,
+    # volumn,
+    polygonArea,
+    # dist2shore,
+    elevation,
+    total_precipitation_stdDev,
+    mean_2m_air_temperature_stdDev
+    # lon,
+    # lat
+    )
+
+
+
+model_input %>% names %>% paste(collapse = " + ")
+
+fitted_raw = rpart(mode ~ ., data = model_input)
+fitted = as.party.rpart(obj = fitted_raw) ## convert to party object
+
+plot(fitted)
+
+terminal_node_ids = nodeids(fitted, terminal = T)
+fitted[15]$data %>% as_tibble %>% ggplot() + geom_histogram(aes(mode), bins = 30)
+
+## attached the leaf node id to each obs
+for (i in terminal_node_ids) {
+  temp = fitted[i]$data %>% as_tibble %>% 
+    left_join(modelInput %>% select(unimodal, lon, lat, elevation, mode, winter_temperature_mean, summer_temperature_mean, depthMean)) %>% 
+    mutate(id = i)
+  if(i == terminal_node_ids[1]) {
+    pred = temp
+  } else if (i != terminal_node_ids[1]) {
+    pred = bind_rows(pred, temp)
+  }
+}
+
+pred %>% count(id) ## no. of leaf nodes
+
+pred %>% group_by(id) %>% 
+  summarise(blue_ratio = sum(mode <= 526) / n()) %>% 
+  ungroup() %>% 
+  arrange(desc(blue_ratio))
+
+## create individual violin plot for each node
+
+bw = 1.5
+den_all = pred %>% pull(mode) %>% density(bw = bw)
+color_fill_all = den_all[1:2] %>% as_tibble() %>% rename(mode = x, d = y) %>% 
+  mutate(d = d * nrow(pred))
+
+maxd = max(color_fill_all$d) / 2.5
+
+for (i in terminal_node_ids) {
+  
+  node_id = i
+  
+  this_pred = pred %>% filter(id == node_id)
+  den = this_pred %>% pull(mode) %>% density(bw = bw)
+  color_fill = den[1:2] %>% as_tibble() %>% rename(mode = x, d = y) %>% 
+    mutate(d = d * nrow(this_pred))
+  
+  this_node_distribution = ggplot() +
+    # geom_segment(data = color_fill_all, aes(x = -d, xend = d, y = mode, yend = mode), lwd = 1, show.legend = FALSE, color = "grey") +
+    geom_segment(data = color_fill, aes(x = -d, xend = d, y = mode, yend = mode, color = mode), lwd = 1, show.legend = FALSE) +
+    scale_x_continuous(limits = c(-maxd, maxd)) +
+    scale_y_continuous(limits = c(465, 595)) +
+    scale_color_gradientn(colors = dw2FUI(seq(min(color_fill$mode), max(color_fill$mode), by = 1))) +
+    theme_void()
+  
+  this_node_distribution
+  
+  this_node_distribution %>% ggsave(filename = paste0("figs/this_node_distribution_node_id_", i, ".png"), width = 1, height = 2)
+}
+
+## end
+
+terminal_node_ids
+nodeName = tibble(node_id = c(14, 13, 15, 10, 9, 6, 5, 7),
+       node_name = c("shallow, cool, dry",
+                     "shallow, cool, wet",
+                     "shallow, warm",
+                     "deep, low elevation, dry",
+                     "deep, low elevation, wet",
+                     "deep, cool, dry",
+                     "deep, cool, wet",
+                     "deep, warm")) %>% 
+  mutate(order = 1:8)
+
+pred_sf =  pred %>% st_as_sf(coords = c("lon", "lat"), crs = 4326)
+world_sf = st_as_sf(rnaturalearthdata::coastline110)
+
+strip_text = pred %>% 
+  left_join(nodeName, by = c("id" = "node_id")) %>% 
+  group_by(id) %>% 
+  summarise(
+    nlakes = n(),
+    nperlakes = nlakes / nrow(pred) * 100,
+    id_text = paste0(node_name, ": (", format(nperlakes, digits = 3), "%)"),
+    order = first(order)) %>% 
+  ungroup() %>% 
+  distinct() %>% 
+  mutate(id_text = fct_reorder(id_text, order))
+
+node_maps = pred %>% 
+  left_join(strip_text, by = "id") %>% 
+  st_as_sf(coords = c("lon", "lat"), crs = 4326) %>%
+  ggplot() +
+  # geom_sf(data = st_as_sf(rnaturalearthdata::coastline110), color = "darkgrey", lwd = 0.5) +
+  geom_sf(data = world_sf, color = "darkgrey", lwd = 0.2) +
+  geom_sf(aes(color = mode), cex = 0.1, alpha = 0.3) +
+  coord_sf(ylim = c(-60, 85)) +
+  theme_bw() +
+  scale_color_gradientn(limits = c(472, 588), colours = dw2FUI(472:588), na.value='#FFFFFF00',
+                        guide = guide_colorbar(title.position = "top", title.hjust = 0)) +
+  labs(color = "Lake color (nm)") +
+  facet_wrap(~id_text, ncol = 2) +
+  theme(legend.position = "bottom",
+        legend.direction = "horizontal",
+        panel.grid = element_blank(),
+        strip.background = element_blank(),
+        strip.text = element_text(face = "bold"),
+        panel.border = element_rect(color = "grey80"))
+
+node_maps
+
+node_maps %>% ggsave(filename = "figs/node_maps_colored_dots_FUI_newName.png",
+                     width = 6,
+                     height = 7
+                     )
+```
+
+## party tree
+
+```{r}
+require(ggparty)
+
+example_ggparty_tree = fitted %>% 
+  ggparty(terminal_space = 0.4) +
+  geom_edge(aes(lwd = nodesize)) +
+  # geom_edge(aes(lwd = nodesize), ids = c(2, 8, 9, 10), color = "red") + ## to highlight path to certain node
+  geom_edge_label(mapping = aes(label = paste(substr(breaks_label, start = 1, stop = 15)))) +
+  geom_node_splitvar(color = "grey10", fill = "white", label.padding = unit(0.2, "lines"), angle = 90, fontface = "bold") +
+  geom_node_info(
+    aes(label = paste0("Node ", id)),
+    fontface = "bold",
+    ids = "terminal",
+    size = 3,
+    # 0.01 nudge_y is enough to be above the node plot since a terminal
+    # nodeplot's top (not center) is at the node's coordinates.
+    nudge_y = 0.01
+    ) +
+  geom_node_plot(gglist = list(
+    geom_histogram(data = model_input, aes(mode), fill = "grey80", bins = 50, alpha = 1),
+    geom_histogram(aes(mode), bins = 50, fill = "grey10"), 
+    geom_vline(data = tibble(xintercept = c(495, 574)), aes(xintercept = xintercept), color = "orange", lty = 3),
+    scale_y_continuous(expand = expansion(mult = c(0, 0.1))),
+    theme_bw(), 
+    theme(
+      text = element_text(size = 10),
+      axis.text.x.bottom = element_text(angle = 90, vjust = 0.5, hjust = 0),
+      axis.text.y = element_blank(),
+      axis.title.y = element_blank(),
+      axis.ticks.y = element_blank()
+     ),
+    labs(
+      x = NULL,
+      y = NULL)
+    # coord_fixed(ratio = 0.001)
+    # annotation_custom(grob = ggplot() + geom_bar(data = pred, aes(x = "", fill = unimodal), position = "fill") + coord_polar("y") + theme_void(), xmin = 490, xmax = 525)
+    ),
+    shared_axis_labels = T) +
+  # geom_node_plot(gglist = list(
+  #   geom_sf(data = world_sf, color = "darkgrey", lwd = 0.1),
+  #   geom_sf(data = pred_sf, cex = 0.1, color = "orange", alpha = 0.2),
+  #   # geom_pointdensity(data = pred, aes(x = lon, y = lat), size = 0.1, alpha = 0.5),
+  #   # scale_colour_viridis_c(),
+  #   theme_bw(),
+  #   theme(
+  #     panel.grid = element_blank(),
+  #     axis.text.x.bottom = element_text()
+  #   )
+  #   ), 
+  #   shared_axis_labels = T,
+  #   shared_legend = T,
+  #   width = 0.5,
+  #   nudge_x = 0.15) +
+  # geom_node_plot(gglist = list(
+  #   geom_bar(data = pred, aes(x = "", fill = unimodal), position = "fill"),
+  #   coord_polar("y"),
+  #   theme_void()
+  #   # theme(
+  #   #   axis.text.x.bottom = element_text(angle = 90, vjust = 0.5, hjust = 0),
+  #   #   axis.text.y = element_blank(),
+  #   #   axis.title.y = element_blank(),
+  #   #   axis.ticks.y = element_blank()
+  #   #  )
+  #   ), 
+  #   shared_axis_labels = T,
+  #   height = 0.4,
+  #   nudge_y = -0.2) +
+  theme(legend.position = "none",
+        text = element_text(size = 10))
+
+example_ggparty_tree
+
+example_ggparty_tree %>% ggsave(
+  filename = "figs/ggparty_tree_with_histogram_nohighlight_small.png",
+  width = 10,
+  height = 10
+)
+
+sw_temperature = model_input %>% ggplot(aes(x = summer_temperature_mean, y = winter_temperature_mean)) + geom_point(cex = 0.1, alpha = 0.2) +
+  geom_smooth(method = "lm")
+
+sw_temperature %>% ggsave(filename = "figs/s_w_temperature_relationship.png", height = 6, width = 6)
+
+model_input %>% filter((summer_temperature_mean >= 18.44 - 1) & (summer_temperature_mean <= 18.44 + 1)) %>% 
+  ggplot() + geom_histogram(aes(x = winter_temperature_mean))
+```
+
+
+## supp figures
+
+```{r}
+depthAreaHist = modelInput %>% select(depthMean, polygonArea, id) %>% pivot_longer(cols = depthMean:polygonArea) %>% 
+  ggplot(aes(x = value)) +
+  geom_histogram(fill = "grey30", color = "grey90") +
+  scale_x_log10() +
+  facet_wrap(~name, scales = "free") + 
+  labs(x = "")
+
+depthAreaHist
+
+depthAreaHist %>% ggsave(filename = "figs/depthAreaHist.png", width = 7, height = 4)
+
+## depth vs area
+require(ggpointdensity)
+shoreArea_depth = modelInput %>% 
+  ggplot(aes(x = depthMean, y = shoreLength / polygonArea)) +
+  geom_pointdensity() +
+  scale_x_log10() +
+  scale_y_log10() +
+  scale_colour_viridis_c() +
+  geom_smooth() +
+  geom_vline(aes(xintercept = 3.158))
+
+shoreArea_depth
+
+shoreArea_depth %>% ggsave(filename = "figs/shoreArea_depth.png", width = 6, height = 5)
+
+
+## summer vs winter SAT
+swSAT = modelInput %>% 
+  mutate(blue = mode <= 526) %>% 
+  ggplot(aes(x = summer_temperature_mean, y = winter_temperature_mean, color = mode)) +
+  geom_point(size = 0.1, alpha = 0.5) +
+  geom_smooth(method = "lm") +
+  scale_color_gradientn(limits = c(472, 588), colours = dw2FUI(472:588), na.value='#FFFFFF00') +
+  facet_wrap(~blue)
+
+swSAT
+
+swSAT %>% ggsave(filename = "figs/dwSAT.png", width = 7, height = 4)
+
+swSAT = modelInput %>% 
+  mutate(blue = mode <= 526) %>% 
+  ggplot(aes(x = summer_temperature_mean, y = winter_temperature_mean, color = mode)) +
+  geom_point(size = 0.1, alpha = 0.5) +
+  geom_smooth(method = "lm") +
+  scale_color_gradientn(limits = c(472, 588), colours = dw2FUI(472:588), na.value='#FFFFFF00') +
+  facet_wrap(~blue)
+
+swSAT
+
+## color and precip group
+require(ggridges)
+precip_mode = modelInput %>% 
+  mutate(precip_grp = base::cut(spring_total_precipitation_mean, breaks = quantile(spring_total_precipitation_mean, probs = seq(0, 1, by = 0.25)), include.lowest = T)) %>% 
+  ggplot(aes(x = mode, y = precip_grp)) +
+  geom_density_ridges_gradient() +
+  # scale_fill_gradientn(limits = c(472, 588), colours = dw2FUI(472:588), na.value='#FFFFFF00') +
+  theme_ridges(font_size = 13, grid = TRUE) +
+  labs(y = "spring precip grp", x = "modal color")
+
+precip_mode
+
+precip_mode %>% ggsave(filename = "figs/precip_mode.png", width = 6, height = 4)
+
+## winter mean temp and lake color
+
+climte_variable_grps = modelInput %>% 
+  mutate(
+    winter_temperature_mean = winter_temperature_mean - 273.15,
+    winter_temp_grp = base::cut(winter_temperature_mean, breaks = seq(-45, 35, by = 10), include.lowest = T),
+    # winter_temp_grp = fct_lump_min(winter_temp_grp, min = 300), 
+    `dw ≤ 526?` = cut(mode, breaks = c(min(mode), 526, max(mode)), labels = c("Blue", "Non-blue"), include.lowest = T),
+    precip_grp = base::cut(spring_total_precipitation_mean * 1000, breaks = stats::quantile(spring_total_precipitation_mean * 1000, probs = seq(0, 1, by = 1/3)), include.lowest = T),
+    depth_grp = base::cut(depthMean, breaks = c(min(depthMean), 3.2, max(depthMean)), include.lowest = T))
+
+climte_variable_blue_ratios = climte_variable_grps %>% 
+  group_by(winter_temp_grp, precip_grp) %>% 
+  summarise(blue_ratio = sum(mode <= 526) / n(),
+            n = n()) %>% 
+  ungroup()
+
+climte_variable_blue_ratios = climte_variable_grps %>% 
+  group_by(winter_temp_grp, precip_grp, depth_grp) %>% 
+  summarise(blue_ratio = sum(mode <= 526) / n(),
+            n = n()) %>% 
+  ungroup()
+
+climate_depth_blue_lake_ratio = climte_variable_grps %>% 
+  ggplot(aes(x = winter_temp_grp)) +
+  # geom_bar(aes(fill = `dw ≤ 526?`), position = "fill") +
+  geom_bar(aes(fill = `dw ≤ 526?`), position = "stack") +
+  # geom_line(data = climte_variable_blue_ratios, aes(x = as.integer(winter_temp_grp), y = blue_ratio * 28000), lty = 2) +
+  # geom_point(data = climte_variable_blue_ratios, aes(x = winter_temp_grp, y = blue_ratio * 28000, size = n), alpha = 0.7) +
+  geom_line(data = climte_variable_blue_ratios, aes(x = as.integer(winter_temp_grp), y = blue_ratio * 28000, color = depth_grp), lty = 1) +
+  geom_point(data = climte_variable_blue_ratios, aes(x = winter_temp_grp, y = blue_ratio * 28000, color = depth_grp), alpha = 0.8, cex = 3) +
+  labs(x = "Winter mean surface air temperature ºC",
+       y = "Lake count",
+       size = "Lake count",
+       color = "Mean depth (m)") +
+  scale_y_continuous(expand = expansion(c(0, 0.03), 0), sec.axis = sec_axis(trans = function(x) {return(x / 28000)}, name = "Percent blue lakes", labels = scales::percent_format())) +
+  scale_color_manual(values = grey(seq(0, 0.8, by = 0.8 / 2)) %>% rev()) +
+  facet_wrap(~precip_grp) +
+  theme_bw() +
+  theme(axis.text.x.bottom = element_text(angle = -90, hjust = 0, vjust = 0.5),
+        legend.position = "bottom",
+        legend.direction = "horizontal")
+
+climate_depth_blue_lake_ratio
+
+climate_depth_blue_lake_ratio %>% ggsave(filename = "figs/climate_depth_blue_lake_ratio.png", width = 7, height = 3.5)
+
+
+
+## winter mean temp and lake color
+
+climte_variable_grps = modelInput %>% 
+  mutate(
+    # summer_temperature_mean = summer_temperature_mean - 273.15,
+    summer_temp_grp = base::cut(summer_temperature_mean, breaks = seq(-5, 45, by = 5), include.lowest = T),
+    # winter_temp_grp = fct_lump_min(winter_temp_grp, min = 300), 
+    `dw ≤ 526?` = cut(mode, breaks = c(min(mode), 526, max(mode)), labels = c("Blue", "Non-blue"), include.lowest = T),
+    precip_grp = base::cut(spring_total_precipitation_mean * 1000, breaks = stats::quantile(spring_total_precipitation_mean * 1000, probs = seq(0, 1, by = 1/3)), labels = c("Low precip ≤22.5", "Moderate precip (22.5, 43.2]", "High precip >43.2"), include.lowest = T),
+    depth_grp = base::cut(depthMean, breaks = c(min(depthMean), 3.2, max(depthMean)), labels = c("≤3.2", ">3.2"), include.lowest = T))
+
+climte_variable_blue_ratios = climte_variable_grps %>% 
+  group_by(summer_temp_grp, precip_grp) %>% 
+  summarise(blue_ratio = sum(mode <= 526) / n(),
+            n = n()) %>% 
+  ungroup()
+
+climte_variable_blue_ratios = climte_variable_grps %>% 
+  group_by(summer_temp_grp, precip_grp, depth_grp) %>% 
+  summarise(blue_ratio = sum(mode <= 526) / n(),
+            n = n()) %>% 
+  ungroup()
+
+climate_depth_blue_lake_ratio = climte_variable_grps %>% 
+  ggplot(aes(x = summer_temp_grp)) +
+  # geom_bar(aes(fill = `dw ≤ 526?`), position = "fill") +
+  geom_bar(aes(fill = `dw ≤ 526?`), position = "stack") +
+  # geom_line(data = climte_variable_blue_ratios, aes(x = as.integer(winter_temp_grp), y = blue_ratio * 28000), lty = 2) +
+  # geom_point(data = climte_variable_blue_ratios, aes(x = winter_temp_grp, y = blue_ratio * 28000, size = n), alpha = 0.7) +
+  geom_line(data = climte_variable_blue_ratios, aes(x = as.integer(summer_temp_grp), y = blue_ratio * 28000, color = depth_grp), lty = 1) +
+  geom_point(data = climte_variable_blue_ratios, aes(x = summer_temp_grp, y = blue_ratio * 28000, color = depth_grp), alpha = 0.8, cex = 3) +
+  geom_vline(aes(xintercept = 6), color = "red") +
+  labs(x = "Summer mean surface air temperature ºC",
+       y = "Lake count",
+       size = "Lake count",
+       color = "Mean depth (m)",
+       fill = "") +
+  scale_y_continuous(expand = expansion(c(0, 0.03), 0), sec.axis = sec_axis(trans = function(x) {return(x / 28000)}, name = "Percent blue lakes", labels = scales::percent_format())) +
+  scale_color_manual(values = grey(seq(0, 0.8, by = 0.8 / 2)) %>% rev()) +
+  facet_wrap(~precip_grp) +
+  theme_bw() +
+  theme(axis.text.x.bottom = element_text(angle = -90, hjust = 0, vjust = 0.5),
+        legend.position = "bottom",
+        legend.direction = "horizontal")
+
+climate_depth_blue_lake_ratio
+
+climate_depth_blue_lake_ratio %>% ggsave(filename = "figs/summer_climate_depth_blue_lake_ratio.png", width = 7, height = 3.5)
+
+
+### remove the bar plot
+climate_depth_blue_lake_ratio = climte_variable_blue_ratios %>% 
+  ggplot() +
+  geom_point(aes(x = summer_temp_grp, y = blue_ratio, color = depth_grp, size = n), alpha = 0, cex = 3) +
+  geom_line(aes(x = as.integer(summer_temp_grp), y = blue_ratio, color = depth_grp), lty = 1) +
+  geom_point(aes(x = summer_temp_grp, y = blue_ratio, color = depth_grp, size = n), alpha = 0.8) +
+  geom_vline(aes(xintercept = 6), color = "red") +
+  labs(x = "Summer mean surface air temperature ºC",
+       y = "Blue lake ratio",
+       size = "Lake count",
+       color = "Mean depth (m)") +
+  scale_y_continuous(expand = expansion(c(0, 0.03), 0), labels = scales::percent_format()) +
+  scale_size_area(guide = guide_legend(title.position = "top")) +
+  scale_color_manual(values = grey(seq(0, 0.8, by = 0.8 / 2)) %>% rev(), guide = guide_legend(title.position = "top")) +
+  facet_wrap(~precip_grp) +
+  theme_bw() +
+  theme(axis.text.x.bottom = element_text(angle = -90, hjust = 0, vjust = 0.5),
+        legend.position = "bottom",
+        legend.direction = "horizontal")
+
+climate_depth_blue_lake_ratio
+
+climate_depth_blue_lake_ratio %>% ggsave(filename = "figs/summer_climate_depth_blue_lake_ratio_nobar.png", width = 7, height = 3.5)
+
+
+
+## grid scale median lake color vs color spatial variability
+
+color_std_scatter = grid_color_mode %>% 
+  ggplot(aes(x = median, y = sd)) +
+  geom_point(aes(size = n, color = median), alpha = 0.8) +
+  scale_color_gradientn(limits = c(472, 588), colours = dw2FUI(472:588), na.value='#FFFFFF00') +
+  # geom_smooth(alpha = 0.7, method = "loess") +
+  labs(
+    x = "Median modal color (nm)",
+    y = "Spatial model color standard deviation (nm)",
+    size = "No. of lakes"
+  ) +
+  theme_bw()
+
+color_std_scatter
+
+color_std_scatter %>% ggsave(filename = "figs/color_std_scatter.png",
+                             width = 7,
+                             height = 4)
+
+## summer vs winter temperature
+
+summer_winter_temperature = modelInput %>% 
+  ggplot(aes(x = summer_temperature_mean, y = winter_temperature_mean)) +
+  geom_point(size = 0.1, alpha = 0.3) +
+  geom_smooth(method = "lm", aes(color = "Linear regression")) +
+  coord_equal() +
+  labs(x = "Summer mean surface air temperature ºC",
+       y = "Winter mean surface air temperature ºC",
+       color = "") +
+  theme_bw() +
+  theme(legend.position = "bottom")
+
+summer_winter_temperature
+
+summer_winter_temperature %>% 
+  ggsave(filename = "figs/summer_winter_temperature.png",
+         width = 4,
+         height = 8)
+
+
+## grid cell lake no. vs color variability
+
+color_std_scatter = grid_color_mode %>% 
+  ggplot(aes(x = n, y = sd)) +
+  geom_point(aes(color = median), alpha = 0.6) +
+  scale_color_gradientn(limits = c(472, 588), colours = dw2FUI(472:588), na.value='#FFFFFF00') +
+  scale_x_log10() +
+  # geom_smooth(alpha = 0.7, method = "loess") +
+  labs(
+    x = "Lake count",
+    y = "Color variability (nm)",
+    color = "Median lake color (nm)"
+  ) +
+  theme_bw() +
+  theme(legend.position = "bottom",
+        legend.direction = "horizontal")
+
+color_std_scatter
+
+color_std_scatter %>% ggsave(filename = "figs/color_std_lake_no.png",
+                             width = 7,
+                             height = 4)
+
+## grid cell lake variability vs median color
+
+color_std_scatter2 = grid_color_mode %>% 
+  mutate(color_grp = cut(median, breaks = c(min(median), 526, max(median)), labels = c("Blue", "Non-blue"), include.lowest = T)) %>% 
+  ggplot(aes(x = color_grp, y = sd)) +
+  geom_violin(scale = "count", fill = "darkgrey") +
+  # scale_color_gradientn(limits = c(472, 588), colours = dw2FUI(472:588), na.value='#FFFFFF00') +
+  # scale_x_log10() +
+  # geom_smooth(alpha = 0.7, method = "loess") +
+  labs(
+    x = "",
+    y = "Color variability (nm)"
+    # color = "Median lake color (nm)"
+  ) +
+  theme_bw() +
+  theme(legend.position = "bottom",
+        legend.direction = "horizontal")
+
+color_std_scatter2
+
+color_std_scatter2 %>% ggsave(filename = "figs/color_std2.png",
+                             width = 4,
+                             height = 4)
+
+## latitudinal color pattern
+
+modelInput %>% names()
+modelInput %>% dplyr::select(lat) %>% summary()
+
+lat_std = modelInput %>% 
+  mutate(latGrp = base::cut(lat, breaks = seq(-54, 78, by = 3), include.lowest = T, ordered_results = T)) %>% 
+  group_by(latGrp) %>% 
+  summarise(
+    median_color = median(mode),
+    n_lakes = n(),
+    color_std = sd(mode)
+  ) %>% ungroup() %>% 
+  ggplot(aes(x = color_std, y = latGrp)) +
+  geom_point(aes(size = n_lakes), alpha = 0.7) +
+  scale_color_gradientn(limits = c(472, 588), colours = dw2FUI(472:588), na.value='#FFFFFF00') +
+  labs(x = "Color variability (nm)",
+       y = "Latitudinal groups (º)",
+       size = "No. of lakes") +
+  theme_bw()
+
+lat_std
+
+lat_std %>% ggsave(filename = "figs/lat_std.png",
+                   width = 5,
+                   height = 8)
+```
+
+
+## old code 
+
+### Modal color distribution (AGU 2020 slides, distributions)
+
+```{r}
+load("outputs/datMode20_c2d77db60e960bbcd721fb580fa05896.RData", verbose = T)
+
+## modal color
+
+h = hist(datMode$mode, breaks = 50)
+histdat = tibble(mids = h$mids, d = h$density)
+d = density(datMode$mode)
+dendat = tibble(dw = d$x, y = d$y)
+
+maxs = dendat %>% 
+  mutate(grp = cut(dw, breaks = c(380, 530, 600))) %>% 
+  group_by(grp) %>% 
+  summarise(dwmax = dw[which.max(y)],
+            ymax = y[which.max(y)]) %>% 
+  ungroup()
+
+
+temp = dendat %>% filter(dw > 510, dw < 550)
+mins = temp %>% 
+  summarise(dwmin = dw[which.min(y)],
+            ymin = y[which.min(y)])
+
+summary(datMode$mode)
+
+modalColorDist = datMode %>% 
+  ggplot() + 
+  geom_bar(data = histdat, aes(x = mids, y = d), stat = "identity", fill = "lightgray", color = "white") +
+  geom_vline(data = maxs, aes(xintercept = dwmax), color = "grey20", lty = 3) +
+  geom_vline(data = mins, aes(xintercept = dwmin), color = "grey20", lty = 3) +
+  geom_density(aes(x = mode), fill = NA, color = "black") +
+  annotate("text", x = maxs$dwmax - 1, y = maxs$ymax + 0.005, angle = 90, label = paste0(format(maxs$dwmax, digits = 0), " nm"), hjust = 0, color = "black", vjust = 0) +
+  annotate("text", x = mins$dwmin - 1, y = mins$ymin + 0.005, angle = 90, label = paste0(format(mins$dwmin, digits = 0), " nm"), hjust = 0, color = "black", vjust = 0) +
+  scale_y_continuous(limits = c(0, 0.055), expand = expansion(mult = c(0, .05))) +
+  labs(x = "Modal lake center color (dominant wavelength: nm)",
+       y = "Density") +
+  theme_bw()
+
+modalColorDist
+
+modalColorDist %>% ggsave(filename = "figs/modalColorDist_c2d77db60e960bbcd721fb580fa05896.png",
+                          width = 6, height = 3, dpi = "print")
+
+### color comparing modal and instant
+dat0 = datFil %>% 
+  dplyr::select(id, dwLehmann) %>% 
+  na.omit() %>% 
+  group_by(id) %>% 
+  mutate(n = n()) %>% 
+  ungroup() %>% 
+  filter(n >= 20)
+
+
+modalColorDist = datMode %>% 
+  ggplot() + 
+  geom_density(data = dat0, aes(x = dwLehmann), fill = NA, color = "grey", lwd = 1.5) +
+  # geom_bar(data = histdat, aes(x = mids, y = d), stat = "identity", fill = "lightgray", color = "white") +
+  geom_vline(data = maxs, aes(xintercept = dwmax), color = "grey20", lty = 3) +
+  geom_density(aes(x = mode), fill = NA, color = "black", lwd = 1.5) +
+  annotate("text", x = maxs$dwmax - 1, y = maxs$ymax + 0.005, angle = 90, label = paste0(format(maxs$dwmax, digits = 0), " nm"), hjust = 0, color = "black", vjust = 0) +
+  scale_y_continuous(limits = c(0, 0.055), expand = expansion(mult = c(0, .05))) +
+  scale_x_continuous(limits = c(472.7, 587.7)) +
+  labs(x = "Modal lake center color (dominant wavelength: nm)",
+       y = "Density") +
+  theme_bw()
+
+modalColorDist
+
+modalColorDist %>% ggsave(filename = "figs/modalColorDist_2_c2d77db60e960bbcd721fb580fa05896.png",
+                          width = 6, height = 3, dpi = "print")
+
+
+### distribution of color variation
+
+h = hist(datMode$dwStd, breaks = 50)
+histdat = tibble(mids = h$mids, d = h$density)
+d = density(datMode$dwStd)
+dendat = tibble(dw = d$x, y = d$y)
+
+maxs = dendat %>% 
+  mutate(grp = cut(dw, breaks = c(-1, 10, 60))) %>% 
+  group_by(grp) %>% 
+  summarise(dwmax = dw[which.max(y)],
+            ymax = y[which.max(y)]) %>% 
+  ungroup() %>% 
+  na.omit()
+
+temp = dendat %>% filter(dw > 4, dw < 20)
+mins = temp %>% 
+  summarise(dwmin = dw[which.min(y)],
+            ymin = y[which.min(y)])
+
+std_dist = datMode %>% 
+  ggplot() + 
+  geom_bar(data = histdat, aes(x = mids, y = d), stat = "identity", fill = "lightgray", color = "white") +
+  geom_vline(data = maxs, aes(xintercept = dwmax), color = "grey20", lty = 3) +
+  geom_vline(data = mins, aes(xintercept = dwmin), color = "grey20", lty = 3) +
+  geom_density(aes(x = dwStd), fill = NA, color = "black") +
+  annotate("text", x = maxs$dwmax - 0.5, y = maxs$ymax + 0.005, angle = 90, label = paste0(format(maxs$dwmax, digits = 0), " nm"), hjust = 0, color = "black", vjust = 0) +
+  annotate("text", x = mins$dwmin - 0.5, y = mins$ymin + 0.005, angle = 90, label = paste0(format(mins$dwmin, digits = 0), " nm"), hjust = 0, color = "black", vjust = 0) +
+  scale_y_continuous(limits = c(0, 0.06), expand = expansion(mult = c(0, .05))) +
+  labs(x = "Lake center color standard deviation (dominant wavelength: nm)",
+       y = "Density") +
+  theme_bw()
+
+std_dist
+
+std_dist %>% ggsave(filename = "figs/std_dist_c2d77db60e960bbcd721fb580fa05896.png",
+                          width = 6, height = 3, dpi = "print")
+
+
+
+### std distribution for color groups
+
+h = hist(datMode$dwStd, breaks = 50)
+histdat = tibble(mids = h$mids, d = h$density)
+d = density(datMode$dwStd)
+dendat = tibble(dw = d$x, y = d$y)
+
+temp = dendat %>% filter(dw > 4, dw < 20)
+mins = temp %>% 
+  summarise(dwmin = dw[which.min(y)],
+            ymin = y[which.min(y)])
+
+std_dist_groups = datMode %>% 
+  mutate(colorGrp = cut(mode, breaks = c(390, 530, 600), include.lowest = T, labels = c("Blue lakes", "Yellow lakes"))) %>% 
+  ggplot() + 
+  geom_bar(data = histdat, aes(x = mids, y = d), stat = "identity", fill = "lightgrey", color = "white") +
+  # geom_density(data = datMode, aes(x = dwStd), color = "black", alpha = 1, fill = NA) +
+  geom_density(aes(x = dwStd, color = colorGrp), alpha = 1, lwd = 1, show.legend = F) +
+  geom_density(data = datMode, aes(x = dwStd), color = "black", alpha = 1, fill = NA, lwd = 1) +
+  geom_vline(data = mins, aes(xintercept = dwmin), color = "grey20", lty = 3) +
+  annotate("text", x = mins$dwmin - 0.5, y = mins$ymin + 0.005, angle = 90, label = paste0(format(mins$dwmin, digits = 0), " nm"), hjust = 0, color = "black", vjust = 0) +
+  scale_y_continuous(limits = c(0, 0.07), expand = expansion(mult = c(0, .05))) +
+  labs(x = "Lake center color standard deviation (dominant wavelength: nm)",
+       y = "Density",
+       color = "Modal color group") +
+  scale_color_discrete(direction = -1) +
+  theme_bw()
+
+std_dist_groups
+
+std_dist_groups %>% ggsave(filename = "figs/std_dist_groups_2_c2d77db60e960bbcd721fb580fa05896.png",
+                          width = 6, height = 3, dpi = "print")
+
+
+```
+
+
+### Map lake modal color and other parameters (AGU 2020 maps)
+```{r}
+# require(raster)
+require(rnaturalearthdata)
+
+colorGen = function() {
+    return(c('#610061', '#640066', '#67006A', '#6A006F', '#6D0073', '#6F0077', '#72007C', '#740080', '#760084', '#780088', '#79008D', '#7B0091', '#7C0095', '#7E0099', '#7F009D', '#8000A1', '#8100A5', '#8100A9', '#8200AD', '#8200B1', '#8300B5', '#8300B9', '#8300BC', '#8300C0', '#8200C4', '#8200C8', '#8100CC', '#8100CF', '#8000D3', '#7F00D7', '#7E00DB', '#7C00DE', '#7B00E2', '#7900E6', '#7800E9', '#7600ED', '#7400F1', '#7100F4', '#6F00F8', '#6D00FB', '#6A00FF', '#6600FF', '#6100FF', '#5D00FF', '#5900FF', '#5400FF', '#5000FF', '#4B00FF', '#4600FF', '#4200FF', '#3D00FF', '#3800FF', '#3300FF', '#2E00FF', '#2800FF', '#2300FF', '#1D00FF', '#1700FF', '#1100FF', '#0A00FF', '#0000FF', '#000BFF', '#0013FF', '#001BFF', '#0022FF', '#0028FF', '#002FFF', '#0035FF', '#003BFF', '#0041FF', '#0046FF', '#004CFF', '#0051FF', '#0057FF', '#005CFF', '#0061FF', '#0066FF', '#006CFF', '#0071FF', '#0076FF', '#007BFF', '#007FFF', '#0084FF', '#0089FF', '#008EFF', '#0092FF', '#0097FF', '#009CFF', '#00A0FF', '#00A5FF', '#00A9FF', '#00AEFF', '#00B2FF', '#00B7FF', '#00BBFF', '#00C0FF', '#00C4FF', '#00C8FF', '#00CDFF', '#00D1FF', '#00D5FF', '#00DAFF', '#00DEFF', '#00E2FF', '#00E6FF', '#00EAFF', '#00EFFF', '#00F3FF', '#00F7FF', '#00FBFF', '#00FFFF', '#00FFF5', '#00FFEA', '#00FFE0', '#00FFD5', '#00FFCB', '#00FFC0', '#00FFB5', '#00FFA9', '#00FF9E', '#00FF92', '#00FF87', '#00FF7B', '#00FF6E', '#00FF61', '#00FF54', '#00FF46', '#00FF38', '#00FF28', '#00FF17', '#00FF00', '#09FF00', '#0FFF00', '#15FF00', '#1AFF00', '#1FFF00', '#24FF00', '#28FF00', '#2DFF00', '#31FF00', '#36FF00', '#3AFF00', '#3EFF00', '#42FF00', '#46FF00', '#4AFF00', '#4EFF00', '#52FF00', '#56FF00', '#5AFF00', '#5EFF00', '#61FF00', '#65FF00', '#69FF00', '#6CFF00', '#70FF00', '#73FF00', '#77FF00', '#7BFF00', '#7EFF00', '#81FF00', '#85FF00', '#88FF00', '#8CFF00', '#8FFF00', '#92FF00', '#96FF00', '#99FF00', '#9CFF00', '#A0FF00', '#A3FF00', '#A6FF00', '#A9FF00', '#ADFF00', '#B0FF00', '#B3FF00', '#B6FF00', '#B9FF00', '#BDFF00', '#C0FF00', '#C3FF00', '#C6FF00', '#C9FF00', '#CCFF00', '#CFFF00', '#D2FF00', '#D5FF00', '#D8FF00', '#DBFF00', '#DEFF00', '#E1FF00', '#E4FF00', '#E7FF00', '#EAFF00', '#EDFF00', '#F0FF00', '#F3FF00', '#F6FF00', '#F9FF00', '#FCFF00', '#FFFF00', '#FFFC00', '#FFF900', '#FFF600', '#FFF200', '#FFEF00', '#FFEC00', '#FFE900', '#FFE600', '#FFE200', '#FFDF00', '#FFDC00', '#FFD900', '#FFD500', '#FFD200', '#FFCF00', '#FFCB00', '#FFC800', '#FFC500', '#FFC100', '#FFBE00', '#FFBB00', '#FFB700', '#FFB400', '#FFB000', '#FFAD00', '#FFA900', '#FFA600', '#FFA200', '#FF9F00', '#FF9B00', '#FF9800', '#FF9400', '#FF9100', '#FF8D00', '#FF8900', '#FF8600', '#FF8200', '#FF7E00', '#FF7B00', '#FF7700', '#FF7300', '#FF6F00', '#FF6B00', '#FF6700', '#FF6300', '#FF5F00', '#FF5B00', '#FF5700', '#FF5300', '#FF4F00', '#FF4B00', '#FF4600', '#FF4200', '#FF3E00', '#FF3900', '#FF3400', '#FF3000', '#FF2B00', '#FF2600', '#FF2100', '#FF1B00', '#FF1600', '#FF1000', '#FF0900', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000'))}
+colors = colorGen()
+dt_projection = "+proj=robin +lon_0=0 +datum=WGS84 +units=m +no_defs" 
+
+cl = rnaturalearthdata::countries50 %>% 
+  st_as_sf() %>% 
+  filter(continent != "Antarctica") %>% 
+  st_transform(dt_projection) %>% 
+  st_union()
+
+bounds = st_bbox(cl)
+
+load("outputs/datMode20_c2d77db60e960bbcd721fb580fa05896.RData", verbose = T)
+lakeData = st_read(dsn = "outputs/lake_samples_jida_05172020.shp")
+lakeData = lakeData %>% st_transform(crs = dt_projection)
+lakeData = lakeData %>% mutate(size = st_area(geometry))
+
+## lake modal color
+
+lakeParam = lakeData %>% 
+    left_join(datMode, by = "id") %>% 
+    na.omit() %>% 
+    arrange(desc(size)) %>% 
+    dplyr::select(mode)
+  
+colorRaster = stars::st_rasterize(sf = lakeParam, nx = 3000, ny = 2000, options = c("ALL_TOUCHED=TRUE", "MERGE_ALG=REPLACE"))
+  
+globalColorMap = ggplot() +
+  geom_sf(data = cl, color = NA, fill = "black") +
+  geom_stars(data = colorRaster) +
+  scale_fill_gradientn(limits = c(450, 600), colours = colors[71:221], na.value='#FFFFFF00',
+                       guide = guide_colorbar(title = "Modal dominant wavelength (nm)", title.position = "top", title.hjust = 0, barwidth = 15, barheight = 0.4)) +
+  coord_sf(crs = dt_projection, expand = F, xlim = bounds[c(1, 3)], ylim = bounds[c(2, 4)]) +
+  theme(legend.position = "bottom",
+        legend.direction = "horizontal",
+        panel.background = element_rect(fill = NA, color = NA),
+        panel.grid = element_blank(),
+        axis.text.x = element_blank(),
+        axis.text.y = element_blank(),
+        axis.title.y = element_blank(),
+        axis.title.x = element_blank(), 
+        axis.ticks.y = element_blank(),
+        axis.ticks.x = element_blank())
+
+globalColorMap
+
+globalColorMap %>% ggsave(filename = "figs/globalLakeModalColor_2bb54406aeffd6b652123878457838eb.png", width = 7, height = 4, dpi = "print")
+
+
+
+## lake std modal color
+
+lakeParam = lakeData %>% 
+    left_join(datMode, by = "id") %>% 
+    na.omit() %>% 
+    arrange(desc(size)) %>% 
+    dplyr::select(dwStd)
+
+hist(lakeParam$dwStd)
+  
+colorRaster = stars::st_rasterize(sf = lakeParam, nx = 3000, ny = 2000, options = c("ALL_TOUCHED=TRUE", "MERGE_ALG=REPLACE"))
+  
+globalColorMap = ggplot() +
+  geom_sf(data = cl, color = NA, fill = "black") +
+  geom_stars(data = colorRaster) +
+  scale_fill_viridis_c(limits = c(0, 30), option = "plasma", begin = 0.4, na.value='#FFFFFF00',
+                       guide = guide_colorbar(title = "Standard deviation dominant wavelength (nm)", title.position = "top", title.hjust = 0, barwidth = 15, barheight = 0.4), oob = scales::squish) +
+  coord_sf(crs = dt_projection, expand = F, xlim = bounds[c(1, 3)], ylim = bounds[c(2, 4)]) +
+  theme(legend.position = "bottom",
+        legend.direction = "horizontal",
+        panel.background = element_rect(fill = NA, color = NA),
+        panel.grid = element_blank(),
+        axis.text.x = element_blank(),
+        axis.text.y = element_blank(),
+        axis.title.y = element_blank(),
+        axis.title.x = element_blank(), 
+        axis.ticks.y = element_blank(),
+        axis.ticks.x = element_blank())
+
+globalColorMap
+
+globalColorMap %>% ggsave(filename = "figs/globalLakeStdColor_2bb54406aeffd6b652123878457838eb.png", width = 7, height = 4, dpi = "print")
+
+
+## lake unimodality
+
+lakeParam = lakeData %>% 
+  left_join(datMode, by = "id") %>% 
+  na.omit() %>% 
+  arrange(desc(size)) %>% 
+  dplyr::select(unimodal) %>% 
+  mutate(unimodal = as.integer(unimodal == "Unimodal"))
+
+hist(lakeParam$unimodal)
+  
+colorRaster = stars::st_rasterize(sf = lakeParam, nx = 3000, ny = 2000, options = c("ALL_TOUCHED=TRUE", "MERGE_ALG=REPLACE"))
+  
+globalColorMap = ggplot() +
+  geom_sf(data = cl, color = NA, fill = "black") +
+  geom_stars(data = cut(colorRaster, breaks = c(0, 0.5, 1), include.lowest = T, labels = c("Nonunimodal", "Unimodal"))) +
+  scale_fill_manual(values = c("cyan", "red"), na.value='#FFFFFF00',
+                       guide = guide_legend(title = "Unimodality", title.position = "top", title.hjust = 0)) +
+  coord_sf(crs = dt_projection, expand = F, xlim = bounds[c(1, 3)], ylim = bounds[c(2, 4)]) +
+  theme(legend.position = "bottom",
+        legend.direction = "horizontal",
+        panel.background = element_blank(),
+        panel.grid = element_line(color = "lightgrey"),
+        axis.text.y = element_blank(),
+        axis.title.y = element_blank(),
+        axis.title.x = element_blank(), 
+        axis.ticks.y = element_blank(),
+        axis.ticks.x = element_line(color = "grey"),
+        axis.text = element_text(color = "grey"), 
+        plot.title = element_text(hjust = 0.5))
+
+globalColorMap
+
+globalColorMap %>% ggsave(filename = "figs/globalLakeUnimodal_2bb54406aeffd6b652123878457838eb.png", width = 7, height = 4, dpi = "print")
+
+
+## lake member
+
+datModeGroup = datMode %>% 
+  mutate(modeGrp = cut(mode, breaks = c(300, 526, 600), labels = c("blue", "yellow")),
+         dwStdGrp = cut(dwStd, breaks = c(0, 9, 50), labels = c("stable", "variable")),
+         group = forcats::fct_cross(modeGrp, dwStdGrp)) %>% 
+  dplyr::select(group, id)
+
+datModeGroup %>% dplyr::select(group) %>% mutate(int = as.numeric(group)) %>% distinct
+
+datModeGroup = datModeGroup %>% mutate(group = as.numeric(group))
+
+lakeParam = lakeData %>% 
+  left_join(datModeGroup, by = "id") %>% 
+  na.omit() %>% 
+  arrange(desc(size)) %>% 
+  dplyr::select(group)
+
+hist(lakeParam$group)
+  
+colorRaster = stars::st_rasterize(sf = lakeParam, nx = 3000, ny = 2000, options = c("ALL_TOUCHED=TRUE", "MERGE_ALG=REPLACE")) %>% 
+  cut(breaks = c(1, 1.5, 2.5, 3.5, 4), include.lowest = T, labels = c("Blue:Stable", "Yellow:Stable", "Blue:Variable", "Yellow:Variable"))
+  
+globalColorMap = ggplot() +
+  geom_sf(data = cl, color = NA, fill = "black") +
+  geom_stars(data = colorRaster) +
+  scale_fill_manual(values = c("cyan", "orange", "lightblue", "yellow"), na.value='#FFFFFF00',
+                       guide = guide_legend(title = "Lake groups", title.position = "top", title.hjust = 0)) +
+  coord_sf(crs = dt_projection, expand = F, xlim = bounds[c(1, 3)], ylim = bounds[c(2, 4)]) +
+  theme(legend.position = "bottom",
+        legend.direction = "horizontal",
+        panel.background = element_rect(fill = NA, color = NA),
+        panel.grid = element_blank(),
+        axis.text.x = element_blank(),
+        axis.text.y = element_blank(),
+        axis.title.y = element_blank(),
+        axis.title.x = element_blank(), 
+        axis.ticks.y = element_blank(),
+        axis.ticks.x = element_blank())
+
+globalColorMap
+
+globalColorMap %>% ggsave(filename = "figs/globalLakeGroups_2bb54406aeffd6b652123878457838eb.png", width = 7, height = 4, dpi = "print")
+```
+
+
+## Group lakes
+
+### Assign groups, export for GEE app
+
+```{r}
+load("outputs/datMode20_c2d77db60e960bbcd721fb580fa05896.RData", verbose = T)
+
+datModeGroup = datMode %>% 
+  mutate(modeGrp = cut(mode, breaks = c(300, 526, 600), labels = c("blue", "yellow")),
+         dwStdGrp = cut(dwStd, breaks = c(0, 9, 50), labels = c("stable", "variable")),
+         nobsGrp = cut(nobs, breaks = c(20, 40, 400), include.lowest = T, labels = c("[20, 40]", "(40, 400]")),
+         group = forcats::fct_cross(modeGrp, dwStdGrp)) %>% 
+  dplyr::select(-modeGrp, -dwStdGrp)
+
+datModeGroup %>% 
+  sample_n(30000) %>% 
+  ggplot() +
+  geom_point(aes(x = mode, y = dwStd, color = group), alpha = 0.3, size = 0.1)
+
+save(datModeGroup, file = "outputs/datModeGroup_assigned_c2d77db60e960bbcd721fb580fa05896.RData")
+
+write_csv(datModeGroup %>% mutate(groupInt = as.numeric(group)), path = "outputs/datModeGroup_assigned_c2d77db60e960bbcd721fb580fa05896.csv")
+```
+
+## old figures
+
+### lake color density with histogram overlay
+```{r}
+### ggplot density plot + histogram overlay
+load("outputs/dat_just_modal_color.RData", verbose = T)
+histdata = datMode$mode %>% hist(freq = FALSE, plot = F, breaks = seq(472, 591, by = 3))
+histdata = histdata[c("density", "mids")] %>% as_tibble()
+
+dist_mod = datMode %>% ggplot() +
+  geom_vline(data = mode_to_label, aes(xintercept = x), color = "darkgrey") +
+  ggridges::stat_density_ridges(geom = "density_ridges_gradient", aes(x = mode, y = 0, fill = stat(x)), color = NA, show.legend = F, bandwidth = 3, scale = 1) +
+  geom_histogram(aes(x = mode, y = stat(density)), binwidth = 3, fill = NA, color = "grey40") +
+  scale_fill_gradientn(limits = c(450, 600), colours = dw2FUI(450:600), na.value='#FFFFFF00') +
+  scale_x_continuous(breaks = seq(470, 600, by = 10), limits = c(470, 600), sec.axis = dup_axis(name = NULL, breaks = mode_to_label$x, labels = paste(format(mode_to_label$x, digits = 2), "nm"))) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.05))) +
+  labs(x = "Dominant wavelength (nm)",
+       y = "Probability") +
+  theme_bw() +
+  theme(
+    # axis.title.y = element_blank(),
+    # axis.text.y = element_blank(),
+    axis.text.x = element_text(angle = 0),
+    axis.ticks.y = element_blank(),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor.y = element_blank(),
+    panel.background = element_blank())
+
+dist_mod
+
+dist_mod %>% ggsave(filename = "figs/dist_mod_FUI_color_with_histogram.png",
+                    width = 5,
+                    height = 3)
+```
+
+### other global grid scale plots
+```{r}
+load("outputs/grid_color_stats_raw.RData", verbose = T)
+
+grid_color_stats = grid_color_stats_raw %>% pivot_longer(cols = median_mode:sd_dwStd) %>% separate(name, into = c("metric", "variable"), sep = "_")
+
+grid_color_mode = grid_color_stats %>% filter(variable == "mode") %>% pivot_wider(names_from = metric, values_from = value) %>% st_as_sf
+
+grid_color_dwStd = grid_color_stats %>% filter(variable == "dwStd") %>% pivot_wider(names_from = metric, values_from = value) %>% st_as_sf
+
+grid_color_combined = grid_color_stats %>% filter(metric == "median") %>% pivot_wider(names_from = variable, values_from = value) %>% st_as_sf
+## assign FUI color
+# FUI = get_FUI()
+# grid_color_combined = grid_color_combined %>% 
+#   mutate(fui = cut(mode, breaks = FUI$threshods, labels = FUI$color_table$levels, include.lowest = T)) %>% 
+#   left_join(FUI$color_table, by = c("fui" = "levels"))
+
+dist_mod = modelInput %>% ggplot() +
+  ggridges::geom_density_ridges_gradient(aes(x = mode, y = 1, fill = stat(x)), color = NA, show.legend = F) +
+  scale_fill_viridis_c(limits = c(469, 598)) +
+  scale_x_continuous(breaks = seq(470, 580, by = 10)) +
+  labs(x = "Dominant wavelength") +
+  theme_bw() +
+  theme(axis.title.y = element_blank(),
+        axis.text.y = element_blank(),
+        axis.text.x = element_text(angle = 90),
+        axis.ticks.y = element_blank(),
+        panel.grid.major.y = element_blank(),
+        panel.grid.minor.y = element_blank(),
+        panel.background = element_blank())
+
+countries %>% st_transform(crs = crs_string) %>% st_bbox()
+
+
+
+
+global_dist_mode_dwStd = ggplot() + 
+  geom_sf(data = countries %>% st_transform(crs = crs_string), fill = "grey60", color = NA) +
+  geom_sf(data = grid_color_combined %>% st_transform(crs = crs_string), aes(color = mode, size = dwStd), alpha = 0.8) + 
+  coord_sf(crs = crs_string, expand = expansion(0, 0)) +
+  annotation_custom(ggplotGrob(dist_mod), xmin = -16810131 * 0.3 - 16810131 * 0.65, ymin = -5900074 * 0.3 - 5900074 * 0.4, xmax = 16810131 * 0.3 - 16810131 * 0.85, ymax = 8343004 * 0.3 - 5900074 * 0.3) +
+  # geom_sf(data = grid %>% st_transform(crs = crs_string), fill = NA, color = "grey30", lwd = 0.1, alpha = 0.2) +
+  scale_colour_viridis_c() +
+  # scale_color_binned()
+  scale_size_area(max_size = 1.5) +
+  labs(color = "Median modal color", size = "Median temporal dw sd") +
+  theme_dark() +
+  theme(legend.position = "bottom")
+
+global_dist_mode_dwStd
+
+global_dist_mode_dwStd %>% ggsave(filename = "figs/global_dist_mode_dwStd.png",
+                       width = 8,
+                       height = 5)
+
+
+## export data for GEE app
+gee_grid_color = grid_color_mode %>% mutate(pcolor = dw2FUI(median), pointType = "o")
+
+gee_grid_color %>% st_write(obj = ., dsn = "outputs/gee_grid_color_6_16_2021.shp")
+
+global_dist_dwStd = ggplot() + 
+  geom_sf(data = countries, fill = "grey40", color = NA) +
+  geom_sf(data = grid_color_dwStd, aes(color = median, size = sd)) + geom_sf(data = grid, fill = NA, color = "grey20", lwd = 0.1) +
+  geom_sf(data = grid_color_dwStd, aes(color = median)) + geom_sf(data = grid, fill = NA, color = "grey20", lwd = 0.1) +
+  scale_colour_viridis_c() +
+  scale_size_area(max_size = 3) +
+  labs(color = "Median dw variability", size = "sd of dw std") +
+  theme_dark() +
+  theme(legend.position = "bottom")
+
+global_dist_dwStd %>% ggsave(filename = "figs/global_dist_dwStd.png",
+                       width = 8,
+                       height = 5)
+
+global_dist_mode_dwStd
+global_dist_mode
+global_dist_dwStd
+
+## sd and n
+
+sd_lake_density = grid_color_mode %>% 
+  ggplot(aes(x = n, y = sd, color = median)) +
+  geom_point(size = 0.3, alpha = 0.4) +
+  scale_x_log10() +
+  scale_color_gradientn(limits = c(480, 588), colours = dw2FUI(480:588), na.value='#FFFFFF00') +
+  theme(legend.position = "bottom",
+        panel.background = element_rect(fill = "grey20")) +
+  labs(x = "No. of lakes in the grid cell", 
+       y = "Modal color standard variation (nm)",
+       color = "median modal color (nm)")
+
+sd_lake_density
+
+sd_lake_density %>% ggsave(filename = "figs/sd_lake_density.png", width = 7, height = 4)
+```
+
+
+
+### modeling code
+
+
+```{r}
+require(tidyverse)
+require(tidymodels)
+require(finetune)
+require(tune)
+load("outputs/modelInput_20210302.RData", verbose = T)
+
+## correlation matrix for all feature numeric
+modelInput %>% 
+  select(mode, lakeMeanOcc, mean_2m_air_temperature_mean:total_precipitation_stdDev, depthMean, volumn, elevation:fall_total_precipitation_mean) %>% 
+  cor() %>% corrplot::corrplot(.)
+
+
+model_input = modelInput %>% 
+  select(mode, lakeMeanOcc, mean_2m_air_temperature_mean:total_precipitation_stdDev, depthMean, volumn, elevation:fall_total_precipitation_mean, class) %>% 
+  mutate(
+    mean_2m_air_temperature_mean = mean_2m_air_temperature_mean - 273.15,
+    winter_temperature_mean = winter_temperature_mean - 273.15,
+    summer_temperature_mean = summer_temperature_mean - 273.15,
+    spring_temperature_mean = spring_temperature_mean - 273.15,
+    fall_temperature_mean = fall_temperature_mean - 273.15,
+    class = as.factor(class)
+    )
+
+skimr::skim(model_input)
+
+set.seed(123)
+color_split = initial_split(data = model_input, strata = mode)
+train_data = training(color_split)
+test_data = testing(color_split)
+
+folds = vfold_cv(train_data, strata = mode, v = 10)
+```
+
+### model tuning
+
+```{r}
+color_rec = recipe(formula = mode ~ ., data = train_data)
+
+model_spec = rand_forest(
+  trees = 1000,
+  mtry = tune(),
+  min_n = tune()
+  ) %>% 
+  set_engine("ranger") %>% 
+  set_mode("regression")
+
+tree_wf = workflow() %>% 
+  add_recipe(color_rec) %>% 
+  add_model(model_spec)
+
+t1 = Sys.time()
+doParallel::registerDoParallel()
+tree_res = tree_wf %>% finetune::tune_race_anova(resample = folds, grid = 10, control = control_race(save_pred = T, verbose = T))
+t2 = Sys.time() - t1
+
+save(tree_res, file = "outputs/rf_mode_color_all_features_05192021_grid10.RData")
+
+tree_res %>% autoplot()
+```
+
+### build the final model
+
+```{r}
+## build the final model using the best params
+best_params = tree_res %>% select_best(metric = "rmse")
+
+color_model_spec = model_spec %>% 
+  finalize_model(best_params) %>% 
+  set_engine("ranger", importance = "permutation")
+
+doParallel::registerDoParallel()
+wf_final = workflow() %>% 
+  add_recipe(color_rec) %>% 
+  add_model(color_model_spec) %>% 
+  last_fit(color_split)
+
+save(tree_res, wf_final, file = "outputs/rf_mode_color_all_features_05192021_final_model_grid10.RData")
+
+load("outputs/rf_mode_color_all_features_05192021_final_model_grid10.RData", verbose = T)
+
+wf_final %>% collect_metrics()
+
+mode_vs_pred = wf_final %>% collect_predictions() %>% 
+  ggplot(aes(x = mode, y = .pred)) +
+  geom_hex(bins = 100) +
+  geom_abline(color = "grey") +
+  coord_equal() +
+  scale_fill_viridis_c(direction = -1)
+
+mode_vs_pred
+
+mode_vs_pred %>% ggsave(filename = "figs/mode_vs_pred_all_features_rf.png", width = 7, height = 7)
+
+require(vip)
+vi = wf_final %>% 
+  pull(.workflow) %>% 
+  pluck(1) %>% 
+  pull_workflow_fit() %>% 
+  vip(aesthetics = list(), geom = "col", num_features = 20L)
+
+vi
+
+vi %>% ggsave(filename = "figs/rf_vip_mode_color_all_features.png",
+              width = 7,
+              height = 7)
+```
+
+### data exploration w/ important variables
+
+```{r}
+modelInput %>% 
+  select(mode, elevation, depthMean, lakeMeanOcc, polygonArea) %>% 
+  pivot_longer(elevation:polygonArea) %>% 
+  ggplot(aes(x = value, y = mode)) +
+  geom_hex(aes(fill = log(..count..)), bins = 100) +
+  scale_fill_viridis_c() +
+  scale_x_log10() +
+  facet_wrap(~name, scales = "free_x")
+
+modelInput %>% 
+  select(mode, total_precipitation_mean, winter_temperature_mean) %>% 
+  pivot_longer(total_precipitation_mean:winter_temperature_mean) %>% 
+  ggplot(aes(x = value, y = mode)) +
+  geom_hex(aes(fill = log(..count..)), bins = 100) +
+  scale_fill_viridis_c() +
+  facet_wrap(~name, scales = "free_x")
+
+mode_fun = function(v) {
+   uniqv <- unique(v)
+   uniqv[which.max(tabulate(match(v, uniqv)))]
+}
+
+modelInput %>% 
+  ggplot(aes(x = total_precipitation_mean, y = winter_temperature_mean, z = mode)) +
+  stat_summary_hex(fun = mode_fun, bins = 100) +
+  scale_fill_viridis_c()
+
+modelInput %>% 
+  ggplot(aes(x = depthMean, y = elevation, z = mode)) +
+  stat_summary_hex(fun = mode_fun, bins = 100) +
+  scale_x_log10() +
+  scale_y_log10() +
+  scale_fill_viridis_c()
+
+modelInput %>% 
+  ggplot(aes(x = lakeMeanOcc, y = polygonArea, z = mode)) +
+  stat_summary_hex(fun = mode_fun, bins = 100) +
+  # scale_x_log10() +
+  scale_y_log10() +
+  scale_fill_viridis_c()
+```
