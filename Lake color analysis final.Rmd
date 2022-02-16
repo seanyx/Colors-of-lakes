@@ -308,6 +308,7 @@ write_sf(grid_color_stats_sf, dsn = "outputs/figure1_global_lake_color_map_data.
 ```
 
 ### Figure 1. global distribution of lake color grids
+
 ```{r}
 load("outputs/grid_color_stats_sf.RData", verbose = T)
 grid_color_stats_sf = grid_color_stats_sf %>% st_centroid()
@@ -709,6 +710,7 @@ lake_latlon = lake_coords %>% select(id) %>% mutate(
   lat = st_coordinates(geometry)[, 2]
 ) %>% st_drop_geometry() %>% 
   as_tibble()
+
 load("outputs/20220211_model_input.RData", verbose = T)
 
 model_input = model_input %>% left_join(lake_latlon, by = "id")
@@ -736,11 +738,11 @@ node_blue_ratio
 
 terminal_node_ids
 nodeName = tibble(node_id = terminal_node_ids,
-       node_name = c("wet and cool ",
-                     "wet and warm",
-                     "dry, high elevation, deep",
-                     "dry, high elevation, shallow",
-                     "dry, low elevation")) %>% 
+       node_name = c("wetter and cooler ",
+                     "wetter and warmer",
+                     "drier, higher elev., deeper",
+                     "drier, higher elev., shallower",
+                     "drier, lower elevation")) %>% 
   mutate(order = 1:length(terminal_node_ids))
 
 pred_sf = pred %>% st_as_sf(coords = c("lon", "lat"), crs = 4326)
@@ -765,7 +767,7 @@ node_maps = pred_sf %>%
   geom_sf(aes(color = mode), cex = 0.1, alpha = 0.3) +
   coord_sf(ylim = c(-60, 85)) +
   theme_bw() +
-  scale_color_gradientn(limits = c(472, 588), colours = dw2FUI(472:588), na.value='#FFFFFF00',
+  scale_color_gradientn(limits = c(480, 588), colours = dw2FUI(472:588), na.value='#FFFFFF00',
                         guide = guide_colorbar(title.position = "top", title.hjust = 0)) +
   labs(color = "Lake color (nm)") +
   facet_wrap(~id_text, ncol = 2) +
@@ -779,6 +781,11 @@ node_maps = pred_sf %>%
 node_maps
 
 node_maps %>% ggsave(filename = "figs/FigureS_node_maps_colored_dots_FUI_newName.png",
+                     width = 6,
+                     height = 5.5
+                     )
+
+node_maps %>% ggsave(filename = "figs/FigureS_node_maps_colored_dots_FUI_newName.pdf",
                      width = 6,
                      height = 5.5
                      )
@@ -809,7 +816,7 @@ color_fill = tibble(id = terminal_node_ids) %>% group_by(id) %>%
   }) %>% 
   ungroup()
 
-example_ggparty_tree = fitted %>% 
+ggparty_tree = fitted %>% 
   ggparty(terminal_space = 0.4) +
   geom_edge(aes(lwd = nodesize)) +
   geom_edge_label(mapping = aes(label = paste(substr(breaks_label, start = 1, stop = 15)))) +
@@ -835,15 +842,15 @@ example_ggparty_tree = fitted %>%
   theme(legend.position = "none",
         text = element_text(size = 10))
 
-example_ggparty_tree
+ggparty_tree
 
-example_ggparty_tree %>% ggsave(
+ggparty_tree %>% ggsave(
   filename = "figs/figure2_ggparty_tree_with_histogram.png",
   width = 6.5,
   height = 4.5
 )
 
-example_ggparty_tree %>% ggsave(
+ggparty_tree %>% ggsave(
   filename = "figs/figure2_ggparty_tree_with_histogram.pdf",
   width = 6.5,
   height = 4.5
@@ -858,9 +865,56 @@ model_input %>% filter((summer_temperature_mean >= 18.44 - 1) & (summer_temperat
   ggplot() + geom_histogram(aes(x = winter_temperature_mean))
 ```
 
+## Figure 3
+
+```{r}
+model_input %>% ggplot() + geom_histogram(aes(depth_mean), color = "white") + scale_x_log10()
+model_input %>% filter(depth_mean >= 20) %>% nrow() ## 646 lakes with mean depth ≥ 20 meter
+
+climte_variable_grps = model_input %>%
+  mutate(
+    summer_temp_grp = base::cut(summer_temperature_mean, breaks = seq(-5, 40, by = 2), include.lowest = T, labels = as.character((-2:19) * 2)),
+    `dw ≤ 526?` = cut(mode, breaks = c(min(mode), 526, max(mode)), labels = c("Blue", "Non-blue"), include.lowest = T),
+    precip_grp = base::cut(total_precipitation_mean * 1000, breaks = c(0, 55, max(total_precipitation_mean * 1000)), labels = c("Lower precip ≤ 55 mm", "Higher precip > 55 mm"), include.lowest = T),
+    depth_grp = base::cut(depth_mean, breaks = c(min(depth_mean), 3.64, max(depth_mean)), labels = c("≤3.6", ">3.6"), include.lowest = T))
+
+climte_variable_blue_ratios = climte_variable_grps %>%
+  group_by(summer_temp_grp, precip_grp, depth_grp) %>%
+  summarise(blue_ratio = sum(mode <= 526) / n(),
+            n = n()) %>%
+  ungroup()
+
+climate_depth_blue_lake_ratio = climte_variable_blue_ratios %>% 
+  ggplot() +
+  geom_point(aes(x = summer_temp_grp, y = blue_ratio, color = depth_grp, size = n), alpha = 0, cex = 3) +
+  geom_line(aes(x = as.integer(summer_temp_grp), y = blue_ratio, color = depth_grp), lty = 1) +
+  geom_point(aes(x = summer_temp_grp, y = blue_ratio, color = depth_grp, size = n), alpha = 0.8) +
+  geom_vline(aes(xintercept = 14.5), color = "red") +
+  labs(x = "Summer mean surface air temperature (ºC)",
+       y = "Blue lake ratio",
+       size = "Lake count",
+       color = "Mean depth (m)") +
+  scale_y_continuous(expand = expansion(c(0, 0.03), 0), labels = scales::percent_format()) +
+  scale_size_area(guide = guide_legend(title.position = "top")) +
+    scale_color_manual(values = grey(seq(0.1, 0.6, length = 2)) %>% rev(), guide = guide_legend(title.position = "top")) +
+  facet_wrap(~precip_grp) +
+  theme_bw() +
+  theme(axis.text.x.bottom = element_text(angle = 45, hjust = 0, vjust = 0),
+        legend.position = "bottom",
+        legend.direction = "horizontal")
+
+climate_depth_blue_lake_ratio
+
+climate_depth_blue_lake_ratio %>% ggsave(filename = "figs/Figure3_summer_climate_depth_blue_lake_ratio_temp2bin.png", width = 6.5, height = 3.5)
+
+climate_depth_blue_lake_ratio %>% ggsave(filename = "figs/Figure3_summer_climate_depth_blue_lake_ratio_temp2bin.pdf", width = 6.5, height = 3.5)
+```
+
+
 ## supp figures
 
 ### calculate color stats for each grid
+
 ```{r}
 load("outputs/shallow_deep_lake_ids.RData", verbose = T)
 datMode = datMode %>% inner_join(deep_lake_ids)
@@ -920,243 +974,171 @@ global_depth_dist %>% ggsave(filename = "figs/global_depth_dist_deep_lakes.png",
                        dpi = "retina")
 ```
 
+### summer winter temperature relationship
+
 ```{r}
-depthAreaHist = modelInput %>% select(depthMean, polygonArea, id) %>% pivot_longer(cols = depthMean:polygonArea) %>% 
-  ggplot(aes(x = value)) +
-  geom_histogram(fill = "grey30", color = "grey90") +
-  scale_x_log10() +
-  facet_wrap(~name, scales = "free") + 
-  labs(x = "")
-
-depthAreaHist
-
-depthAreaHist %>% ggsave(filename = "figs/depthAreaHist.png", width = 7, height = 4)
-
-## depth vs area
-require(ggpointdensity)
-shoreArea_depth = modelInput %>% 
-  ggplot(aes(x = depthMean, y = shoreLength / polygonArea)) +
-  geom_pointdensity() +
-  scale_x_log10() +
-  scale_y_log10() +
-  scale_colour_viridis_c() +
-  geom_smooth() +
-  geom_vline(aes(xintercept = 3.158))
-
-shoreArea_depth
-
-shoreArea_depth %>% ggsave(filename = "figs/shoreArea_depth.png", width = 6, height = 5)
-
-
 ## summer vs winter SAT
-swSAT = modelInput %>% 
+swSAT_colorGrp = model_input %>% 
   mutate(blue = mode <= 526,
          blue = factor(blue, levels = c(T, F), labels = c("Blue", "Non-blue"))) %>% 
   ggplot(aes(x = summer_temperature_mean, y = winter_temperature_mean, color = mode)) +
   geom_point(size = 0.1, alpha = 0.5) +
-  geom_vline(aes(xintercept = 18.98, lty = "x = 18.98ºC")) +
+  geom_vline(aes(xintercept = 19, lty = "x = 19.0ºC")) +
   labs(x = "Summer mean surface air temperature (ºC)",
         y = "Winter mean surface air temperature (ºC)",
         lty = "",
         color = "Lake color") +
-  scale_color_gradientn(limits = c(472, 588), colours = dw2FUI(472:588), na.value='#FFFFFF00') +
-  facet_wrap(~blue)
+  scale_color_gradientn(limits = c(480, 588), colours = dw2FUI(480:588), na.value='#FFFFFF00') +
+  facet_wrap(~blue) +
+  theme_bw()
 
-swSAT
+swSAT_colorGrp
 
-swSAT %>% ggsave(filename = "figs/dwSAT.png", width = 7, height = 4)
+swSAT_colorGrp %>% ggsave(filename = "figs/summer_winter_SAT.pdf", width = 7, height = 4)
 
-swSAT = modelInput %>% 
-  mutate(blue = mode <= 526) %>% 
-  ggplot(aes(x = summer_temperature_mean, y = winter_temperature_mean, color = mode)) +
-  geom_point(size = 0.1, alpha = 0.5) +
-  geom_smooth(method = "lm") +
-  scale_color_gradientn(limits = c(472, 588), colours = dw2FUI(472:588), na.value='#FFFFFF00') +
-  facet_wrap(~blue)
+swSAT_colorGrp %>% ggsave(filename = "figs/summer_winter_SAT.png", width = 7, height = 4)
 
-swSAT
+## summer vs winter temperature overall
 
-## color and precip group
-require(ggridges)
-precip_mode = modelInput %>% 
-  mutate(precip_grp = base::cut(spring_total_precipitation_mean, breaks = quantile(spring_total_precipitation_mean, probs = seq(0, 1, by = 0.25)), include.lowest = T)) %>% 
-  ggplot(aes(x = mode, y = precip_grp)) +
-  geom_density_ridges_gradient() +
-  # scale_fill_gradientn(limits = c(472, 588), colours = dw2FUI(472:588), na.value='#FFFFFF00') +
-  theme_ridges(font_size = 13, grid = TRUE) +
-  labs(y = "spring precip grp", x = "modal color")
+lm_eqn <- function(df){
+    m <- lm(y ~ x, df);
+    eq <- substitute(italic(y) == a + b %.% italic(x)*","~~italic(r)^2~"="~r2, 
+         list(a = format(unname(coef(m)[1]), digits = 2),
+              b = format(unname(coef(m)[2]), digits = 2),
+             r2 = format(summary(m)$r.squared, digits = 3)))
+    as.character(as.expression(eq));
+}
 
-precip_mode
+lm_eqn(model_input %>% transmute(x = summer_temperature_mean, y = winter_temperature_mean))
 
-precip_mode %>% ggsave(filename = "figs/precip_mode.png", width = 6, height = 4)
+swfit = lm(winter_temperature_mean~summer_temperature_mean, data = model_input)
 
-## winter mean temp and lake color
+predict(swfit, newdata = tibble(summer_temperature_mean = 18.98), se.fit = T)
+swfit %>% summary()
+# y = -45.4 + 2.0 * x (r2 = 0.6)
 
-# climte_variable_grps = modelInput %>% 
-#   mutate(
-#     winter_temperature_mean = winter_temperature_mean - 273.15,
-#     winter_temp_grp = base::cut(winter_temperature_mean, breaks = seq(-45, 35, by = 10), include.lowest = T),
-#     # winter_temp_grp = fct_lump_min(winter_temp_grp, min = 300), 
-#     `dw ≤ 526?` = cut(mode, breaks = c(min(mode), 526, max(mode)), labels = c("Blue", "Non-blue"), include.lowest = T),
-#     precip_grp = base::cut(spring_total_precipitation_mean * 1000, breaks = stats::quantile(spring_total_precipitation_mean * 1000, probs = seq(0, 1, by = 1/3)), include.lowest = T),
-#     depth_grp = base::cut(depthMean, breaks = c(min(depthMean), 3.2, max(depthMean)), include.lowest = T))
-# 
-# climte_variable_blue_ratios = climte_variable_grps %>% 
-#   group_by(winter_temp_grp, precip_grp) %>% 
-#   summarise(blue_ratio = sum(mode <= 526) / n(),
-#             n = n()) %>% 
-#   ungroup()
-# 
-# climte_variable_blue_ratios = climte_variable_grps %>% 
-#   group_by(winter_temp_grp, precip_grp, depth_grp) %>% 
-#   summarise(blue_ratio = sum(mode <= 526) / n(),
-#             n = n()) %>% 
-#   ungroup()
-# 
-# climate_depth_blue_lake_ratio = climte_variable_grps %>% 
-#   ggplot(aes(x = winter_temp_grp)) +
-#   # geom_bar(aes(fill = `dw ≤ 526?`), position = "fill") +
-#   geom_bar(aes(fill = `dw ≤ 526?`), position = "stack") +
-#   # geom_line(data = climte_variable_blue_ratios, aes(x = as.integer(winter_temp_grp), y = blue_ratio * 28000), lty = 2) +
-#   # geom_point(data = climte_variable_blue_ratios, aes(x = winter_temp_grp, y = blue_ratio * 28000, size = n), alpha = 0.7) +
-#   geom_line(data = climte_variable_blue_ratios, aes(x = as.integer(winter_temp_grp), y = blue_ratio * 28000, color = depth_grp), lty = 1) +
-#   geom_point(data = climte_variable_blue_ratios, aes(x = winter_temp_grp, y = blue_ratio * 28000, color = depth_grp), alpha = 0.8, cex = 3) +
-#   labs(x = "Winter mean surface air temperature ºC",
-#        y = "Lake count",
-#        size = "Lake count",
-#        color = "Mean depth (m)") +
-#   scale_y_continuous(expand = expansion(c(0, 0.03), 0), sec.axis = sec_axis(trans = function(x) {return(x / 28000)}, name = "Percent blue lakes", labels = scales::percent_format())) +
-#   scale_color_manual(values = grey(seq(0, 0.8, by = 0.8 / 2)) %>% rev()) +
-#   facet_wrap(~precip_grp) +
-#   theme_bw() +
-#   theme(axis.text.x.bottom = element_text(angle = -90, hjust = 0, vjust = 0.5),
-#         legend.position = "bottom",
-#         legend.direction = "horizontal")
-# 
-# climate_depth_blue_lake_ratio
-# 
-# climate_depth_blue_lake_ratio %>% ggsave(filename = "figs/climate_depth_blue_lake_ratio.png", width = 7, height = 3.5)
+summer_winter_temperature = model_input %>% 
+  ggplot(aes(x = summer_temperature_mean, y = winter_temperature_mean)) +
+  geom_point(size = 0.1, alpha = 0.3) +
+  geom_smooth(method = "lm", aes(color = "Linear regression")) +
+  # coord_equal() +
+  labs(x = "Summer mean surface air temperature (ºC)",
+       y = "Winter mean surface air temperature (ºC)",
+       color = "") +
+  theme_bw() +
+  theme(legend.position = c(0.7, 0.1),
+        legend.box.background = element_blank(),
+        legend.background = element_blank())
 
+summer_winter_temperature
 
+summer_winter_temperature %>% 
+  ggsave(filename = "figs/summer_winter_temperature_overall.pdf",
+         width = 3.5,
+         height = 4)
+
+summer_winter_temperature %>% 
+  ggsave(filename = "figs/summer_winter_temperature_overall.png",
+         width = 3.5,
+         height = 4)
+  
+```
+
+### lake count vs spatial color variability
+
+```{r}
+## grid cell lake no. vs color variability
+load("outputs/grid_color_stats_sf.RData", verbose = T)
+
+color_std_scatter = grid_color_stats_sf %>% 
+  st_drop_geometry() %>% 
+  ggplot(aes(x = nlakes, y = sd_mode)) +
+  geom_point(aes(color = median_mode), alpha = 0.6) +
+  scale_color_gradientn(limits = c(480, 588), colours = dw2FUI(480:588), na.value='#FFFFFF00', guide = guide_colorbar(title.position = "top")) +
+  scale_x_log10() +
+  # geom_smooth(alpha = 0.7, method = "loess") +
+  labs(
+    x = "Lake count",
+    y = "Color variability (nm)",
+    color = "Median lake color (nm)"
+  ) +
+  theme_bw() +
+  theme(legend.position = "bottom",
+        legend.direction = "horizontal")
+
+color_std_scatter
+
+color_std_scatter %>% ggsave(filename = "figs/color_std_lake_no_deep_lakes.png",
+                             width = 7,
+                             height = 4)
+
+cor(grid_color_stats_sf$nlakes, grid_color_stats_sf$sd_mode, method = "pearson", use = "complete.obs")
+```
+
+### lakes susceptible to changing to non-blue color due to climate change 
+
+```{r}
+load("outputs/20220211_model_input.RData", verbose = T)
+
+lake_coords = st_read("outputs/lakeSample_Dp.geojson") %>% 
+  distinct(.keep_all = T)
+
+slakes = model_input %>% 
+  filter(total_precipitation_mean >= 0.055,
+         summer_temperature_mean < 18.98,
+         summer_temperature_mean > 15.98,
+         mode <= 526) %>% 
+  mutate(dif = summer_temperature_mean - 18.98,
+         grp = cut(dif, breaks = c(-3, -2, -1, 0), labels = c("+3ºC", "+2ºC", "+1ºC"), include.lowest = T), ordered_result = T) %>% 
+  select(id, grp, summer_temperature_mean, dif) %>% 
+  na.omit() %>% 
+  left_join(lake_coords, by = "id") %>% 
+  st_as_sf()
+
+countries = st_as_sf(rnaturalearth::countries110) %>% filter(region_un != "Antarctica")
+crs_string = "+proj=robin +lon_0=0 +datum=WGS84 +units=m +no_defs" ## Robinson PROJ WKT
+
+### 
+nrow(slakes) # 3771 lakes at risk
+slakes %>% st_drop_geometry() %>% as_tibble() %>% distinct %>% group_by(grp) %>% count() %>% ungroup()
+# +3ºC   1907, +2ºC   1351, +1ºC    513
+## grp       n
+#   <fct> <int>
+# 1 +3ºC   1907
+# 2 +2ºC   1351
+# 3 +1ºC    513
+
+sus_lake_dist = ggplot() + 
+  geom_sf(data = countries %>% st_transform(crs = crs_string), fill = "grey40", color = NA) +
+  geom_sf(data = slakes %>% st_transform(crs = crs_string), aes(color = grp), alpha = 0.5, size = 0.5) + 
+  coord_sf(crs = crs_string, expand = expansion(0, 0)) +
+  scale_colour_viridis_d() +
+  labs(color = "Blue lakes susciptible to change color to non-blue") +
+  theme_dark() +
+  theme(legend.position = "bottom",
+        panel.border = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        panel.background = element_rect(fill = "grey10"))
+
+sus_lake_dist
+
+sus_lake_dist %>% ggsave(filename = "figs/sus_lake_dist.png",
+                       width = 7.5,
+                       height = 4.5,
+                       dpi = "retina")
+
+sus_lake_dist %>% ggsave(filename = "figs/sus_lake_dist.pdf",
+                       width = 7.5,
+                       height = 4.5,
+                       dpi = "retina")
+```
+
+```{r}
 
 ## summer mean temp and lake color
 
-load("outputs/modelInput_20210719.RData", verbose = T)
-
-modelInput = modelInput %>% 
-  mutate(winter_temperature_mean = winter_temperature_mean - 273.15,
-         summer_temperature_mean = summer_temperature_mean - 273.15,
-         )
-
-## remove shallow lakes
-load("outputs/shallow_deep_lake_ids.RData", verbose = T)
-modelInput = modelInput %>% inner_join(deep_lake_ids)
-
-climte_variable_grps = modelInput %>%
-  mutate(
-    summer_temp_grp = base::cut(summer_temperature_mean, breaks = seq(-5, 45, by = 5), include.lowest = T),
-    `dw ≤ 526?` = cut(mode, breaks = c(min(mode), 526, max(mode)), labels = c("Blue", "Non-blue"), include.lowest = T),
-    precip_grp = base::cut(total_precipitation_mean * 1000, breaks = c(0, 55, max(total_precipitation_mean * 1000)), labels = c("Low precip ≤55", "High precip > 55"), include.lowest = T),
-    depth_grp = base::cut(depthMean, breaks = c(min(depthMean), 3.64, max(depthMean)), include.lowest = T))
-
-# climte_variable_blue_ratios = climte_variable_grps %>%
-#   group_by(summer_temp_grp, precip_grp) %>%
-#   summarise(blue_ratio = sum(mode <= 526) / n(),
-#             n = n()) %>%
-#   ungroup()
-
-climte_variable_blue_ratios = climte_variable_grps %>%
-  group_by(summer_temp_grp, precip_grp, depth_grp) %>%
-  summarise(blue_ratio = sum(mode <= 526) / n(),
-            n = n()) %>%
-  ungroup()
-
-### remove the bar plot
-climate_depth_blue_lake_ratio = climte_variable_blue_ratios %>% 
-  ggplot() +
-  geom_point(aes(x = summer_temp_grp, y = blue_ratio, color = depth_grp, size = n), alpha = 0, cex = 3) +
-  geom_line(aes(x = as.integer(summer_temp_grp), y = blue_ratio, color = depth_grp), lty = 1) +
-  geom_point(aes(x = summer_temp_grp, y = blue_ratio, color = depth_grp, size = n), alpha = 0.8) +
-  geom_vline(aes(xintercept = 6), color = "red") +
-  labs(x = "Summer mean surface air temperature ºC",
-       y = "Blue lake ratio",
-       size = "Lake count",
-       color = "Mean depth (m)") +
-  scale_y_continuous(expand = expansion(c(0, 0.03), 0), labels = scales::percent_format()) +
-  scale_size_area(guide = guide_legend(title.position = "top")) +
-  # scale_color_manual(values = grey(seq(0, 0.8, by = 0.8 / 2)) %>% rev(), guide = guide_legend(title.position = "top")) +
-    scale_color_manual(values = grey(seq(0.1, 0.6, length = 2)) %>% rev(), guide = guide_legend(title.position = "top")) +
-  facet_wrap(~precip_grp) +
-  theme_bw() +
-  theme(axis.text.x.bottom = element_text(angle = -90, hjust = 0, vjust = 0.5),
-        legend.position = "bottom",
-        legend.direction = "horizontal")
-
-climate_depth_blue_lake_ratio
-
-climate_depth_blue_lake_ratio %>% ggsave(filename = "figs/summer_climate_depth_blue_lake_ratio_nobar2_deepLakes.png", width = 6.5, height = 3.5)
-
-
-### previous figure but with finer color binning
-
-modelInput %>% ggplot() + geom_histogram(aes(depthMean), color = "white") + scale_x_log10()
-modelInput %>% filter(depthMean >= 20) %>% nrow() ## 646 lakes with mean depth ≥ 20 meter
-
-climte_variable_grps = modelInput %>%
-  mutate(
-    summer_temp_grp = base::cut(summer_temperature_mean, breaks = seq(-5, 45, by = 2), include.lowest = T),
-    `dw ≤ 526?` = cut(mode, breaks = c(min(mode), 526, max(mode)), labels = c("Blue", "Non-blue"), include.lowest = T),
-    precip_grp = base::cut(total_precipitation_mean * 1000, breaks = c(0, 55, max(total_precipitation_mean * 1000)), labels = c("Low precip ≤55", "High precip > 55"), include.lowest = T),
-    depth_grp = base::cut(depthMean, breaks = c(min(depthMean), 3.64, max(depthMean)), include.lowest = T))
-
-# climte_variable_blue_ratios = climte_variable_grps %>%
-#   group_by(summer_temp_grp, precip_grp) %>%
-#   summarise(blue_ratio = sum(mode <= 526) / n(),
-#             n = n()) %>%
-#   ungroup()
-
-climte_variable_blue_ratios = climte_variable_grps %>%
-  group_by(summer_temp_grp, precip_grp, depth_grp) %>%
-  summarise(blue_ratio = sum(mode <= 526) / n(),
-            n = n()) %>%
-  ungroup()
-
-### remove the bar plot
-climate_depth_blue_lake_ratio = climte_variable_blue_ratios %>% 
-  ggplot() +
-  geom_point(aes(x = summer_temp_grp, y = blue_ratio, color = depth_grp, size = n), alpha = 0, cex = 3) +
-  geom_line(aes(x = as.integer(summer_temp_grp), y = blue_ratio, color = depth_grp), lty = 1) +
-  geom_point(aes(x = summer_temp_grp, y = blue_ratio, color = depth_grp, size = n), alpha = 0.8) +
-  # geom_vline(aes(xintercept = 6), color = "red") +
-  labs(x = "Summer mean surface air temperature ºC",
-       y = "Blue lake ratio",
-       size = "Lake count",
-       color = "Mean depth (m)") +
-  scale_y_continuous(expand = expansion(c(0, 0.03), 0), labels = scales::percent_format()) +
-  scale_size_area(guide = guide_legend(title.position = "top")) +
-  # scale_color_manual(values = grey(seq(0, 0.8, by = 0.8 / 2)) %>% rev(), guide = guide_legend(title.position = "top")) +
-    scale_color_manual(values = grey(seq(0.1, 0.6, length = 2)) %>% rev(), guide = guide_legend(title.position = "top")) +
-  facet_wrap(~precip_grp) +
-  theme_bw() +
-  theme(axis.text.x.bottom = element_text(angle = -90, hjust = 0, vjust = 0.5),
-        legend.position = "bottom",
-        legend.direction = "horizontal")
-
-climate_depth_blue_lake_ratio
-
-climate_depth_blue_lake_ratio %>% ggsave(filename = "figs/summer_climate_depth_blue_lake_ratio_nobar2_deepLakes_temp2bin.png", width = 6.5, height = 3.5)
-
-## relationship between blue lake ratio and other predictors
-modelinput = modelInput %>% mutate(blue = mode <= 526, ice = winter_temperature_mean <= 0)
-lfit = glm(formula = blue~lakeMeanOcc + mean_2m_air_temperature_mean + mean_2m_air_temperature_stdDev + depthMean + elevation + polygonArea + winter_temperature_mean + summer_temperature_mean + summer_total_precipitation_mean + ice, family = binomial(link = "logit"), data = modelinput)
-
-summary(lfit)
-gtsummary::tbl_regression(lfit)
-
-
-modelInput %>% mutate(blue = mode <= 526, ice = winter_temperature_mean <= 0) %>% 
-  ggplot() +
-  geom_density(aes(x = winter_temperature_mean, fill = blue))
+load("outputs/grid_color_stats_sf.RData", verbose = T)
 
 ## grid scale median lake color vs color spatial variability
 
@@ -1178,70 +1160,8 @@ color_std_scatter %>% ggsave(filename = "figs/color_std_scatter.png",
                              width = 7,
                              height = 4)
 
-## summer vs winter temperature
-
-lm_eqn <- function(df){
-    m <- lm(y ~ x, df);
-    eq <- substitute(italic(y) == a + b %.% italic(x)*","~~italic(r)^2~"="~r2, 
-         list(a = format(unname(coef(m)[1]), digits = 2),
-              b = format(unname(coef(m)[2]), digits = 2),
-             r2 = format(summary(m)$r.squared, digits = 3)))
-    as.character(as.expression(eq));
-}
-
-lm_eqn(modelInput %>% transmute(x = summer_temperature_mean, y = winter_temperature_mean))
-
-swfit = lm(winter_temperature_mean~summer_temperature_mean, data = modelInput)
-
-predict(swfit, newdata = tibble(summer_temperature_mean = 18.98), se.fit = T)
-swfit %>% summary()
-# y = -45.4 + 2.0 * x (r2 = 0.6)
-
-summer_winter_temperature = modelInput %>% 
-  ggplot(aes(x = summer_temperature_mean, y = winter_temperature_mean)) +
-  geom_point(size = 0.1, alpha = 0.3) +
-  geom_smooth(method = "lm", aes(color = "Linear regression")) +
-  # geom_text(aes(x = 0, y = 30, label = "y = -45 + 2x, r2 = 0.60")) +
-  coord_equal() +
-  labs(x = "Summer mean surface air temperature ºC",
-       y = "Winter mean surface air temperature ºC",
-       color = "") +
-  theme_bw() +
-  theme(legend.position = "bottom")
-
-summer_winter_temperature
-
-summer_winter_temperature %>% 
-  ggsave(filename = "figs/summer_winter_temperature_deep_lakes.pdf",
-         width = 4,
-         height = 8)
 
 
-## grid cell lake no. vs color variability
-load("outputs/grid_color_stats_raw_deep_lakes.RData", verbose = T)
-
-color_std_scatter = grid_color_stats_raw %>% 
-  ggplot(aes(x = n, y = sd_mode)) +
-  geom_point(aes(color = median_mode), alpha = 0.6) +
-  scale_color_gradientn(limits = c(472, 588), colours = dw2FUI(472:588), na.value='#FFFFFF00', guide = guide_colorbar(title.position = "top")) +
-  scale_x_log10() +
-  # geom_smooth(alpha = 0.7, method = "loess") +
-  labs(
-    x = "Lake count",
-    y = "Color variability (nm)",
-    color = "Median lake color (nm)"
-  ) +
-  theme_bw() +
-  theme(legend.position = "bottom",
-        legend.direction = "horizontal")
-
-color_std_scatter
-
-color_std_scatter %>% ggsave(filename = "figs/color_std_lake_no_deep_lakes.png",
-                             width = 7,
-                             height = 4)
-
-cor(grid_color_stats_raw$n, grid_color_stats_raw$sd_mode, method = "pearson", use = "complete.obs")
 
 ## grid cell lake variability vs median color
 
