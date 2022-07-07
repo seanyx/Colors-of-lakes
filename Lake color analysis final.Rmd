@@ -289,10 +289,18 @@ grid_color = grids %>%
   st_drop_geometry() %>% 
   as_tibble()
 
+## add lake area to calculate weighted median of color
+lakeMetric = read_csv("data/lakeMetrics_022b85da71a43d98e7c2cea22c6c0c66.csv")
+grid_color = grid_color %>% 
+  left_join(lakeMetric %>% select(id, area = polygonArea), by = "id")
+
+require(spatstat)
+
 grid_color_stats_sf = grid_color %>% 
   group_by(grid_index) %>% 
   summarise(
     median_mode = median(mode),
+    median_mode_wArea = weighted.median(x = mode, w = area, type = 2),
     sd_mode = sd(mode),
     median_dwStd = median(dwStd),
     sd_dwStd = sd(dwStd),
@@ -303,14 +311,14 @@ grid_color_stats_sf = grid_color %>%
   left_join(grids, by = "grid_index") %>% 
   st_as_sf
 
-save(grid_color_stats_sf, file = "outputs/grid_color_stats_sf.RData")
-write_sf(grid_color_stats_sf, dsn = "outputs/figure1_global_lake_color_map_data.shp")
+save(grid_color_stats_sf, file = "outputs/grid_color_stats_sf_06282022.RData")
+write_sf(grid_color_stats_sf, dsn = "outputs/figure1_global_lake_color_map_data_06282022.shp")
 ```
 
 ### Figure 1. global distribution of lake color grids
 
 ```{r}
-load("outputs/grid_color_stats_sf.RData", verbose = T)
+load("outputs/grid_color_stats_sf_06282022.RData", verbose = T)
 grid_color_stats_sf = grid_color_stats_sf %>% st_centroid()
 
 ## percentage of grid cells having median color in blue (16.2%)
@@ -320,7 +328,7 @@ countries = st_as_sf(rnaturalearth::countries110) %>% filter(region_un != "Antar
 crs_string = "+proj=robin +lon_0=0 +datum=WGS84 +units=m +no_defs" ## Robinson PROJ WKT
 
 global_dist_mode = ggplot() + 
-  geom_sf(data = countries %>% st_transform(crs = crs_string), fill = "grey40", color = NA) +
+  geom_sf(data = countries %>% st_transform(crs = crs_string), fill = "grey20", color = NA) +
   geom_sf(data = grid_color_stats_sf %>% filter(nlakes > 1) %>% st_transform(crs = crs_string), aes(color = median_mode, size = sd_mode), alpha = 0.8) + 
   geom_sf(data = grid_color_stats_sf %>% filter(nlakes == 1) %>% st_transform(crs = crs_string), aes(color = median_mode), alpha = 0.8, size = 0.8, pch = 1) + 
   coord_sf(crs = crs_string, expand = expansion(mult = c(0, 0), add = c(0, 0))) +
@@ -334,11 +342,56 @@ global_dist_mode = ggplot() +
         panel.border = element_blank(),
         axis.text.y = element_blank(),
         axis.ticks.y = element_blank(),
-        panel.background = element_rect(fill = "grey10"))
+        panel.background = element_rect(fill = "grey100"))
 
 global_dist_mode
 
-global_dist_mode %>% ggsave(filename = "figs/fig2_global_dist_mode_Fui_color.png",
+global_dist_mode %>% ggsave(filename = "figs/fig2_global_dist_mode_Fui_color_lightcolor.png",
+                       width = 7.5,
+                       height = 4.5,
+                       dpi = "retina")
+
+global_dist_mode %>% ggsave(filename = "figs/fig2_global_dist_mode_Fui_color_lightcolor.pdf",
+                       width = 7.5,
+                       height = 4.5,
+                       dpi = "retina")
+
+## 85360 lakes for the map
+```
+
+
+### Figure 1. weighted median global distribution of lake color grids
+
+```{r}
+load("outputs/grid_color_stats_sf_06282022.RData", verbose = T)
+grid_color_stats_sf = grid_color_stats_sf %>% st_centroid()
+
+## percentage of grid cells having median color in blue (16.2%)
+grid_color_stats_sf %>% st_drop_geometry() %>% transmute(blue_grid = median_mode <= 526) %>% summarise(blue_grid_ratio = sum(blue_grid) / n())
+
+countries = st_as_sf(rnaturalearth::countries110) %>% filter(region_un != "Antarctica")
+crs_string = "+proj=robin +lon_0=0 +datum=WGS84 +units=m +no_defs" ## Robinson PROJ WKT
+
+global_dist_mode_wArea = ggplot() + 
+  geom_sf(data = countries %>% st_transform(crs = crs_string), fill = "grey20", color = NA) +
+  geom_sf(data = grid_color_stats_sf %>% filter(nlakes > 1) %>% st_transform(crs = crs_string), aes(color = median_mode_wArea, size = sd_mode), alpha = 0.8) + 
+  geom_sf(data = grid_color_stats_sf %>% filter(nlakes == 1) %>% st_transform(crs = crs_string), aes(color = median_mode_wArea), alpha = 0.8, size = 0.8, pch = 1) + 
+  coord_sf(crs = crs_string, expand = expansion(mult = c(0, 0), add = c(0, 0))) +
+  scale_color_gradientn(limits = c(480, 588), colours = dw2FUI(480:588), na.value='#FFFFFF00',
+                        guide = guide_colorbar(title.position = "top", title.hjust = 0)) +
+  scale_size_area(max_size = 2,
+                  guide = guide_legend(title.position = "top", title.hjust = 0)) +
+  labs(color = "Median lake color (nm)", size = "Spatial color variability (nm)") +
+  theme_dark() +
+  theme(legend.position = "bottom",
+        panel.border = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        panel.background = element_rect(fill = "grey100"))
+
+global_dist_mode_wArea
+
+global_dist_mode_wArea %>% ggsave(filename = "figs/fig2_global_dist_mode_wArea_Fui_color_lightcolor.png",
                        width = 7.5,
                        height = 4.5,
                        dpi = "retina")
@@ -649,7 +702,8 @@ model_input %>% mutate(ice_cover = winter_temperature_mean <= 0) %>%
 require(rpart)
 require(partykit)
 require(tidyverse)
-load("outputs/20220211_model_input.RData", verbose = T)
+# load("outputs/20220211_model_input.RData", verbose = T)
+load("outputs/20220619_model_input_depth_updated.RData", verbose = T)
 
 nrow(model_input) ## 77501 lakes for modeling
 
@@ -658,7 +712,7 @@ model_input = model_input %>%
     mode,
     dwStd,
     occ_mean,
-    class,
+    # class,
     winter_temperature_mean,
     summer_temperature_mean,
     total_precipitation_mean,
@@ -673,7 +727,6 @@ model_input = model_input %>%
     )
 
 model_input %>% 
-  select(-class) %>% 
   cor() %>% 
   corrplot::corrplot(.)
 
@@ -681,7 +734,7 @@ model_input = model_input %>% select(-dwStd)
 
 model_input %>% names %>% paste(collapse = " + ")
 
-fitted_raw = rpart(mode ~ ., data = model_input, control = rpart.control(cp = 0.02))
+fitted_raw = rpart(mode ~ ., data = model_input, control = rpart.control(cp = 0.01))
 
 ## model performance rmse, mae, and r2
 model_input %>% 
@@ -693,6 +746,11 @@ model_input %>%
     r2 = 1 - (sum(dif^2)) / (sum((mode - mean(mode))^2))
   ) %>% 
   ungroup()
+
+# # A tibble: 1 × 3
+#    rmse   mae    r2
+#   <dbl> <dbl> <dbl>
+# 1  31.2  26.2 0.196
 
 fitted = as.party.rpart(obj = fitted_raw) ## convert to party object
 
@@ -868,6 +926,7 @@ model_input %>% filter((summer_temperature_mean >= 18.44 - 1) & (summer_temperat
 ## Figure 3
 
 ```{r}
+load("outputs/20220211_model_input.RData", verbose = T)
 model_input %>% ggplot() + geom_histogram(aes(depth_mean), color = "white") + scale_x_log10()
 model_input %>% filter(depth_mean >= 20) %>% nrow() ## 646 lakes with mean depth ≥ 20 meter
 
@@ -889,7 +948,7 @@ climate_depth_blue_lake_ratio = climte_variable_blue_ratios %>%
   geom_point(aes(x = summer_temp_grp, y = blue_ratio, color = depth_grp, size = n), alpha = 0, cex = 3) +
   geom_line(aes(x = as.integer(summer_temp_grp), y = blue_ratio, color = depth_grp), lty = 1) +
   geom_point(aes(x = summer_temp_grp, y = blue_ratio, color = depth_grp, size = n), alpha = 0.8) +
-  geom_vline(aes(xintercept = 14.5), color = "red") +
+  geom_vline(aes(xintercept = 12.5), color = "red") +
   labs(x = "Summer mean surface air temperature (ºC)",
        y = "Blue lake ratio",
        size = "Lake count",
@@ -912,6 +971,54 @@ climate_depth_blue_lake_ratio %>% ggsave(filename = "figs/Figure3_summer_climate
 
 
 ## supp figures
+
+### lake count accouting via density curves
+This is to compare the distribution of lake surface area from (1) the entire lake dataset (2) the 10% sample and the (3) lakes used for modeling
+
+```{r}
+## entire ucla dataset
+layers = st_layers(dsn = "~/Downloads/UCLA_global_lakes_forXiao/Circa2015.gdb/")
+lakes_all = st_read("~/Downloads/UCLA_global_lakes_forXiao/Circa2015.gdb", layer = "Circa2015", query = sprintf("SELECT OBJECTID, Shape_Area, Ave_Dpt, Src_Type FROM \"%s\"", layers$name[1]))
+lakes_all = lakes_all %>% st_drop_geometry() %>% as_tibble()
+save(lakes_all, file = "outputs/ucla_lakes_all.RData")
+
+load("outputs/ucla_lakes_all.RData", verbose = T)
+
+## 10% sample
+lakeMetric = read_csv("data/lakeMetrics_022b85da71a43d98e7c2cea22c6c0c66.csv")
+lakeMetric %>% nrow()
+
+## actual lakes with estimated modal color
+load("outputs/dat_just_modal_color_2022.RData", verbose = T)
+nrow(datMode)
+
+
+merged = lakes_all %>% select(Shape_Area) %>% 
+  filter(Shape_Area >= 100000) %>% 
+  mutate(source = "UCLA circa 2015 Lake Database") %>% 
+  bind_rows(lakeMetric %>% transmute(Shape_Area = polygonArea) %>% mutate(source = "Lake sample")) %>% 
+  bind_rows(datMode %>% select(id) %>% left_join(lakeMetric %>% select(id, polygonArea), by = "id") %>% transmute(Shape_Area = polygonArea) %>% mutate(source = "Lake modal color")) %>% 
+  mutate(source = factor(x = source, levels = c("UCLA circa 2015 Lake Database", "Lake sample", "Lake modal color"), labels = c("UCLA circa 2015 Lake Database", "10% Lake sample", "Lakes with modal color"), ordered = T))
+
+save(merged, file = "outputs/merged_lake_size.RData")
+
+load("outputs/merged_lake_size.RData", verbose = T)
+
+lakesize_distribution = merged %>% ggplot() +
+  geom_histogram(aes(x = Shape_Area / 1000000, fill = source), bins = 50, color = "white") +
+  scale_x_log10() +
+  facet_wrap(~source, scales = "free_y", nrow = 3) +
+  theme_bw() +
+  theme(legend.position = "bottom") +
+  labs(fill = "",
+       y = "Count",
+       x = "Lake area (km2)")
+
+lakesize_distribution
+
+lakesize_distribution %>% ggsave(filename = "figs/lakesize_distribution.png", width = 6, height = 6)
+```
+
 
 ### calculate color stats for each grid
 
@@ -1109,26 +1216,27 @@ slakes %>% st_drop_geometry() %>% as_tibble() %>% distinct %>% group_by(grp) %>%
 # 3 +1ºC    513
 
 sus_lake_dist = ggplot() + 
-  geom_sf(data = countries %>% st_transform(crs = crs_string), fill = "grey40", color = NA) +
+  geom_sf(data = countries %>% st_transform(crs = crs_string), fill = "grey50", color = NA) +
   geom_sf(data = slakes %>% st_transform(crs = crs_string), aes(color = grp), alpha = 0.5, size = 0.5) + 
   coord_sf(crs = crs_string, expand = expansion(0, 0)) +
   scale_colour_viridis_d() +
   labs(color = "Blue lakes susciptible to change color to non-blue") +
+  guides(color = guide_legend(override.aes = list(size = 1))) +
   theme_dark() +
   theme(legend.position = "bottom",
         panel.border = element_blank(),
         axis.text.y = element_blank(),
         axis.ticks.y = element_blank(),
-        panel.background = element_rect(fill = "grey10"))
+        panel.background = element_rect(fill = "grey100"))
 
 sus_lake_dist
 
-sus_lake_dist %>% ggsave(filename = "figs/sus_lake_dist.png",
+sus_lake_dist %>% ggsave(filename = "figs/sus_lake_dist_lightbg.png",
                        width = 7.5,
                        height = 4.5,
                        dpi = "retina")
 
-sus_lake_dist %>% ggsave(filename = "figs/sus_lake_dist.pdf",
+sus_lake_dist %>% ggsave(filename = "figs/sus_lake_dist_lightbg.pdf",
                        width = 7.5,
                        height = 4.5,
                        dpi = "retina")

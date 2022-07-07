@@ -153,10 +153,43 @@ model_input = datMode %>%
   mutate(
     lake_area = lake_area / 1000000,
     volumn = lake_area * depth_mean / 1000) %>% 
-  filter(!is.na(elevation), !is.na(dist_to_shore), !is.na(occ_mean), !is.na(class))
+  filter(!is.na(elevation), !is.na(dist_to_shore), !is.na(occ_mean)) %>% 
+  select(-class)
 
 model_input %>% summary()
 
-save(model_input, file = "outputs/20220211_model_input.RData")
+save(model_input, file = "outputs/20220619_model_input.RData")
+```
+
+correct depths for GRaND reservoirs
+```{r}
+load("outputs/20220619_model_input.RData", verbose = T)
+hl = st_read("~/Google_Drive/Map layers/HydroLAKES_polys_v10_shp/HydroLAKES_polys_v10_shp/HydroLAKES_polys_v10.shp") %>% st_drop_geometry()
+## grand layer
+layers = st_layers(dsn = "data/For_Xiao_Circa2015_Lake_Sample/Circa2015_Lakes_Sample.gdb")
+dat_grand = st_read("data/For_Xiao_Circa2015_Lake_Sample/Circa2015_Lakes_Sample.gdb", layer = "GRanD_reservoirs_v13")
+grand = dat_grand %>% st_drop_geometry() %>% 
+  as_tibble() %>% 
+  filter(LAKE_CTRL %in% c('Enlarged', 'Maybe', 'Yes')) %>% 
+  select(GRAND_ID, DEPTH_M)
+keep = grand %>% filter(GRAND_ID == 7072)
+need_update = grand %>% filter(GRAND_ID != 7072) %>% 
+  left_join(hl %>% select(Hylak_id, Grand_id, Depth_avg), by = c("GRAND_ID"="Grand_id"))
+
+updated_depth = need_update %>% 
+  select(GRAND_ID, Depth_avg) %>% 
+  rename(new_depth = Depth_avg) %>% 
+  bind_rows(keep %>% rename(new_depth = DEPTH_M)) %>% 
+  mutate(id = paste0("grand_", GRAND_ID)) %>% 
+  select(id, new_depth)
+
+## update depth for 118 grand reservoirs labeled as "controled/regulated reservoirs"
+
+model_input = model_input %>% 
+  left_join(updated_depth, by = "id") %>%  ##78 grand reservoirs are updated
+  mutate(depth_mean = if_else(is.na(new_depth), depth_mean, new_depth)) %>% 
+  filter(id != "grand_4690")
+
+save(model_input, file = "outputs/20220619_model_input_depth_updated.RData")
 ```
 

@@ -12,12 +12,20 @@ require(sf)
 require(tidyverse)
 ```
 
+## First 10% of lakes
+
 ```{r}
 layers = st_layers(dsn = "data/For_Xiao_Circa2015_Lake_Sample/Circa2015_Lakes_Sample.gdb")
 
 dat_10per_sample = st_read("data/For_Xiao_Circa2015_Lake_Sample/Circa2015_Lakes_Sample.gdb", layer = "Lakes2015_01km2_natural_others_10p_sample")
 dat_grand = st_read("data/For_Xiao_Circa2015_Lake_Sample/Circa2015_Lakes_Sample.gdb", layer = "GRanD_reservoirs_v13")
 dat_largest200 = st_read("data/For_Xiao_Circa2015_Lake_Sample/Circa2015_Lakes_Sample.gdb", layer = "Lakes2015_01km2_natural_Largest200")
+
+nrow(dat_10per_sample)
+nrow(dat_grand)
+nrow(dat_largest200)
+
+nrow(dat_10per_sample) + nrow(dat_grand) + nrow(dat_largest200)
 
 dat = dat_10per_sample %>% 
   select(Class, UniID) %>% 
@@ -54,7 +62,44 @@ dat_lonlat_group = dat_lonlat %>%
          lat_4grp = cut(lat, breaks = quantile(lat, probs = seq(0, 1, length.out = 5)), include.lowest = T, labels = F)) %>% 
   select(-class, -source, -lon, -lat)
 
-st_write(dat_lonlat_group, dsn = "outputs/lake_samples_05172020.shp")
+st_write(dat_lonlat_group, dsn = "outputs/lake_samples_jida_05172020.shp")
 
+```
+
+## add Lake depth
+
+```{r}
+
+
+layers = st_layers(dsn = "data/For_Xiao_Circa2015_Lake_Sample_v2/Circa2015_Lakes_Sample_v2.gdb/")
+dat_10per_sample = st_read("data/For_Xiao_Circa2015_Lake_Sample_v2/Circa2015_Lakes_Sample_v2.gdb/", layer = "Lakes2015_01km2_natural_others_10p_sample_v2")
+dat_grand = st_read("data/For_Xiao_Circa2015_Lake_Sample_v2/Circa2015_Lakes_Sample_v2.gdb/", layer = "GRanD_reservoirs_v13")
+dat_largest200 = st_read("data/For_Xiao_Circa2015_Lake_Sample_v2/Circa2015_Lakes_Sample_v2.gdb/", layer = "Lakes2015_01km2_natural_Largest200_v2")
+
+dat = dat_10per_sample %>% 
+  select(Class, UniID, LakeName, Ave_Dpt, Vol) %>% 
+  mutate(source = "dat_10per_sample") %>% 
+  rbind(dat_grand %>% 
+          transmute(Class = NA,
+                 source = "dat_grand",
+                 UniID = paste0("grand_", 1:nrow(dat_grand)),
+                 Vol = NA,
+                 Ave_Dpt = DEPTH_M,
+                 LakeName = DAM_NAME)) %>% 
+  rbind(dat_largest200 %>% 
+          select(Class, UniID, LakeName, Ave_Dpt, Vol) %>% 
+          mutate(source = "dat_largest200")) %>% 
+  rename(class = Class,
+         id = UniID,
+         geometry = Shape,
+         lakeName = LakeName,
+         depthMean = Ave_Dpt,
+         volumn = Vol) %>% 
+  filter(st_geometry_type(geometry) == "MULTIPOLYGON")
+
+write_csv(dat %>% st_drop_geometry(), path = "outputs/lake_meta_v2.csv")
+save(dat, file = "outputs/lakes_geometry_v2.RData")
+
+write_csv(dat %>% st_drop_geometry() %>% select(id, depthMean), path = "outputs/lake_sample_depths.csv")
 ```
 
