@@ -1,7 +1,7 @@
 ---
 title: "Lake color analysis"
 author: "Xiao Yang"
-date: "1/31/2020"
+date: "9/7/2020"
 output: html_document
 ---
 
@@ -10,1038 +10,2069 @@ knitr::opts_chunk$set(echo = TRUE)
 
 require(tidyverse)
 require(sf)
-require(foreach)
+
+chroma <- function(R, G, B) {
+  require(colorscience)
+
+  Xi <- 2.7689*R + 1.7517*G + 1.1302*B
+  Yi <- 1.0000*R + 4.5907*G + 0.0601*B
+  Zi <- 0.0565*G + 5.5943*B
+
+  x <-  Xi / (Xi + Yi +  Zi)
+  y <-  Yi / (Xi + Yi +  Zi)
+  z <-  Zi / (Xi + Yi +  Zi)
+
+  alpha <- atan2( (x - 0.33), (y - 0.33)) * 180/pi
+
+  cie <- colorscience::cccie31 %>%
+    mutate(a = atan2( (x - 0.33), (y - 0.33)) * 180/pi) %>%
+    dplyr::filter(wlnm <= 700) %>%
+    dplyr::filter(wlnm >= 380) %>%
+    dplyr::select(a, wlnm) %>%
+    arrange(a)
+
+  wl <- cie[as.vector(sapply(alpha,function(x) which.min(abs(x - cie$a)))), 'wlnm']
+
+  return(wl)
+}
+chroma2 <- function(R, G, B) {
+  # same as chroma but using interpolation instead of nearest neighbor to assign dw from the lookup table
+  require(colorscience)
+
+  Xi <- 2.7689*R + 1.7517*G + 1.1302*B
+  Yi <- 1.0000*R + 4.5907*G + 0.0601*B
+  Zi <- 0.0565*G + 5.5943*B
+
+  x <-  Xi / (Xi + Yi +  Zi)
+  y <-  Yi / (Xi + Yi +  Zi)
+  z <-  Zi / (Xi + Yi +  Zi)
+
+  alpha <- atan2((x - 0.33), (y - 0.33)) * 180/pi
+
+  cie <- colorscience::cccie31 %>%
+    mutate(a = atan2( (x - 0.33), (y - 0.33)) * 180/pi) %>%
+    dplyr::filter(wlnm <= 700) %>%
+    dplyr::filter(wlnm >= 380) %>%
+    dplyr::select(a, wlnm) %>%
+    arrange(a)
+
+  wl = approx(x = cie$a, y = cie$wlnm, xout = alpha, method = "linear")$y
+  # wl <- cie[as.vector(sapply(alpha,function(x) which.min(abs(x - cie$a)))), 'wlnm']
+
+  return(wl)
+}
+chromaLehmann = function(uB, B, G, R) {
+  X = 11.053 * uB + 6.950 * B + 51.135 * G + 34.457 * R
+  Y = 1.320 * uB + 21.053 * B + 66.023 * G + 18.034 * R
+  Z = 58.038 * uB + 34.931 * B + 2.606 * G + 0.016 * R
+  
+  XYZ = X + Y + Z
+  x = X / XYZ
+  y = Y / XYZ
+  z = Z / XYZ
+  
+  #  %% (2 * pi))
+  alpha0 = (atan2(x - 1 / 3, y - 1/3)) * 180 / pi
+  
+  ## angle shift (hue angle in *** and *** have different starting location and range)
+  alpha = 270 - (alpha0  + 180)
+  a = alpha / 100
+  # correction only for 37º to 230º
+  deltaAlpha = -52.16 * a^5 + 373.81 * a^4 - 981.83 * a^3 + 1134.19 * a^2 - 533.61 * a + 76.72
+  deltaS = -0.0099 * a^5 + 0.1199 * a^4 - 0.4594 * a^3 + 0.7515 * a^2 - 0.5095 * a + 0.1222
+  alphaCorrected = alpha + deltaAlpha
+  
+  alpha = 270 - alphaCorrected - 180 ## shift back to -180 to 180 range (cw from neg y axis)
+  
+  oneThird = 1 / 3
+  
+  s = sqrt((x - oneThird)^2 + (y - oneThird)^2)
+  s = s + deltaS
+  
+  cie <- colorscience::cccie31 %>%
+    mutate(a = atan2((x - oneThird), (y - oneThird)) * 180/pi,
+           d = sqrt((x - oneThird)^2 + (y - oneThird)^2)) %>%
+    dplyr::filter(wlnm <= 700) %>%
+    dplyr::filter(wlnm >= 380) %>%
+    select(a, wlnm) %>%
+    arrange(a)
+
+  wl = approx(x = cie$a, y = cie$wlnm, xout = alpha, method = "linear")$y
+  d = approx(x = cie$a, y = cie$d, xout = alpha, method = "linear")$y
+  
+  tibble(alphaXPosUncorrected = a * 100, alphaXPos = alphaCorrected, deltaAlpha, alphaYNeg = alpha, s, wl, x, y, sp = s / d)
+}
 ```
 
-
-## Jida's lake data three regions
+## Import data
 
 ```{r}
-calc_hue_density = function(hue) {
-  
-  d = density(hue, n = 512)
-  
-  hue_density = tibble(hue = d$x, density = d$y) %>% 
-    filter(hue >= 0, hue <= 1) %>% 
-    mutate(rgb_color = hsv(h = hue, s = 1, v = 1))
-  
-  return(hue_density)
-}
-calc_hue_color_bar = function(n = 100) {
-  return(tibble(hue = seq(0, 1, length = n)) %>% mutate(rgb_color = hsv(h = hue, s = 1, v = 1)))
-}
+datDir = dir("~/Google_Drive_morphologee1/Colors of lakes", full.names = T)
 
-## import the dataset
+dat = datDir %>% 
+  map(read_csv) %>% 
+  reduce(rbind)
 
-fileinfo = tibble(
-  filedir = c(
-    "data/mean_lake_color_roi1_8ba054ab336634e127d548f925681daf.csv",
-    "data/mean_lake_color_roi2_dd85cb7c10dd310b1d3d1c93de39514c.csv",
-    "data/mean_lake_color_roi3_c4549c94182362691561ca5712438d23.csv"
-  ),
-  region = c(
-    "Tibetan Plateau",
-    "Minnesota + Wisconsin",
-    "Mackenzie Delta"
-  ))
+datFil = dat %>% 
+  filter(fmask_cloud == 0, 
+         fmask_snowIce == 0,
+         Red >= 0, Red <= 1,
+         Green >= 0, Green <= 1,
+         Blue >= 0, Blue <= 1,
+         uBlue >= 0, uBlue <= 1,
+         dsweNone0 <= 2) %>% 
+  select(id, uBlue, Blue, Green, Red, date, dw, dwLehmann, LANDSAT_ID, mean_2m_air_temperature)
 
-dat = foreach(i = 1:nrow(fileinfo), .combine = "bind_rows") %do% {
-  read_csv(file = fileinfo$filedir[i]) %>% 
-    mutate(region = fileinfo$region[i])
-} %>% 
-    select(-`.geo`) %>% 
-    rename(img_id = `system:index`)
+datFil = datFil %>% 
+  mutate(dwPost = chroma2(Red, Green, Blue),
+         dwLehmannPost = chromaLehmann(uBlue, Blue, Green, Red)$wl,
+         s = chromaLehmann(uBlue, Blue, Green, Red)$s,
+         sp = chromaLehmann(uBlue, Blue, Green, Red)$sp,
+         brightness = sqrt((Red^2 + Green^2 + Blue^2) / 3))
 
-## need to handle the different date string position in the image ID
-
-dat = dat %>% 
-  filter(cloudAndShadow == 0,
-         snowAndIce == 0,
-         Red >= 0,
-         Red <= 10000,
-         Green >= 0,
-         Green <= 10000,
-         Blue >= 0,
-         Blue <= 10000,
-         !is.na(hue)) %>% 
-  mutate(img_id_rev = stringi::stri_reverse(img_id)) %>% 
-  separate(col = img_id_rev, into = c(NA, NA, NA, "satellite"), sep = "_") %>% 
-  mutate(satellite = paste0("Landsat ", substr(satellite, start = 1, stop = 1))) %>% 
-  select(
-    -BQA,
-    -cloudAndShadow,
-    -snowAndIce,
-    -uBlue
-  )
-
-lake_id = dat %>% 
-  select(clon, clat) %>% 
-  distinct()
-
-lake_id = lake_id %>% 
-  mutate(lake_id = 1:nrow(.))
-
-dat = dat %>% 
-  left_join(lake_id, by = c("clon", "clat"))
-
-save(dat, file = "outputs/lake_color_three_regions_20200205.RData")
-
-load("outputs/lake_color_three_regions_20200205.RData", verbose = T)
+save(datFil, file = "outputs/lake_color_per_img_c2d77db60e960bbcd721fb580fa05896.RData")
 
 
-## range of values of hsv
-dat %>% 
-  gather(key = hsv, value = "value", c(hue, saturation, value)) %>% 
-  select(hsv, value) %>% 
-  ggplot() +
-  geom_density(aes(value, fill = hsv), alpha = 0.3)
+print("how many non-null dwLehmann values from how many lakes?")
+distinctObs = datFil %>% select(id, LANDSAT_ID, dwLehmann) %>% filter(!is.na(dwLehmann)) %>% distinct
+distinctObs %>% nrow()
+distinctObs %>% select(id) %>% distinct %>% nrow()
+remove(distinctObs)
+```
 
-# remove lakes with high brightness value and low saturation
-dat = dat %>%
-  filter(saturation >= 0.125,
-         value <= 0.125)
+## Modal color
 
-dat %>% 
-  select(region, lake_id) %>% 
-  distinct() %>% 
-  group_by(region) %>% 
+### Calculate modal color for each lake
+
+```{r}
+require(diptest)
+load("outputs/lake_color_per_img_c2d77db60e960bbcd721fb580fa05896.RData", verbose = T)
+
+datFil %>% dplyr::select(id) %>% distinct() ## 147,025 lakes
+
+obs = datFil %>% 
+  filter(!is.na(dwLehmann)) %>% 
+  group_by(id) %>% 
   count() %>% 
-  ungroup
-
-
-## regional distribution
-
-hue_density_region = dat %>% 
-  mutate(month = factor(month(date), levels = 1:12, labels = month.abb)) %>% 
-  group_by(region) %>% 
-  do({
-    calc_hue_density(.$hue)
-  }) %>% 
-  ungroup
-  
-all_lake_color_region = hue_density_region %>% 
-  ggplot(aes(hue, density)) + 
-  geom_segment(aes(xend = hue, yend = 0, color = rgb_color), alpha = 0.7) + 
-  geom_line(lwd = 1) + 
-  scale_color_identity() +
-  scale_x_continuous(limits = c(0, 1)) +
-  labs(
-    x = "Hue"
-  ) +
-  theme(
-    panel.background = element_blank(),
-    axis.title.y = element_blank(),
-    axis.text.y = element_blank(),
-    axis.ticks.y = element_blank()
-  ) +
-  facet_wrap(~region, ncol = 1)
-
-all_lake_color_region
-
-all_lake_color_region %>% 
-  ggsave(filename = "figures/all_lake_color_three_regions_20200205.png",
-         width = 6,
-         height = 6,
-         dpi = 300)
-
-
-## monthly breakdown
-
-hue_density = dat %>% 
-  mutate(month = factor(month(date), levels = 1:12, labels = month.abb)) %>% 
-  group_by(region, month) %>% 
-  do({
-    calc_hue_density(.$hue)
-  }) %>% 
-  ungroup
-  
-all_lake_color = hue_density %>% 
-  ggplot(aes(hue, density)) + 
-  geom_segment(aes(xend = hue, yend = 0, color = rgb_color), alpha = 0.7) + 
-  geom_line(lwd = 1) + 
-  scale_color_identity() +
-  scale_x_continuous(limits = c(0, 1), expand = c(0, 0)) +
-  labs(
-    y = "Density"
-  ) +
-  theme(
-    panel.background = element_blank(),
-    axis.title = element_blank(),
-    axis.text = element_blank(),
-    axis.ticks = element_blank()
-  ) +
-  facet_grid(month~region, scales = "free_y")
-
-all_lake_color
-
-all_lake_color %>% 
-  ggsave(filename = "figures/all_lake_color_three_regions_monthly_20200205.png",
-         width = 6,
-         height = 7,
-         dpi = 300)
-
-
-## per lake density plot
-
-hue_density_lake = dat %>% 
-  right_join(dat %>% 
-              group_by(lake_id) %>% 
-              summarise(n = n()) %>% 
-              ungroup() %>% 
-              filter(n >= 30), by = "lake_id") %>% 
-  group_by(lake_id) %>% 
-  do({
-    dat_temp = .
-    calc_hue_density(dat_temp$hue) %>% 
-      mutate(n = nrow(dat_temp)) %>% 
-      mutate(region = dat_temp$region[1],
-             clon = dat_temp$clon[1],
-             clat = dat_temp$clat[1])
-  }) %>% 
   ungroup()
 
-yshift = hue_density_lake %>% 
-  group_by(lake_id) %>% 
-  summarize(ymax = max(density),
-            region = first(region)) %>% 
-  arrange(ymax) %>% 
-  ungroup() %>% 
-  group_by(region) %>% 
-  mutate(yshift = 1:n()) %>% 
-  ungroup()
-  
+obs %>% ggplot() + geom_density(aes(n), fill = "grey") +
+  labs(x = "No. of observation", y = "") + geom_vline(data = tibble(x = c(20, 40)), aes(xintercept = x), color = "red") + ggsave(filename = "figs/obs_count_distribution.png", width = 5, height = 4)
 
-hue_density_lake = hue_density_lake %>% 
-  left_join(yshift, by = c("lake_id", "region"))
-
-yscale = hue_density_lake %>% group_by(lake_id, region) %>% summarize(stats = median(density)) %>% ungroup() %>% 
-  group_by(region) %>% 
-  summarise(scale = quantile(stats, probs = 0.3)) %>% 
-  ungroup
-
-hue_density_lake = hue_density_lake %>% 
-  left_join(yscale, by = "region")
-
-lake_color_per_lake = hue_density_lake %>% 
-  ggplot(aes(hue, density + yshift * scale)) + 
-  # geom_segment(data = calc_hue_color_bar(n = 512), aes(x = hue, y = 0, xend = hue, yend = hue_density_lake$density %>% max * 0.02, color = rgb_color), alpha = 1) +
-  # geom_line(aes(group = Hylak_id), alpha = 0.1) +
-  geom_segment(aes(xend = hue, yend = yshift * scale, color = rgb_color, group = lake_id), alpha = 0.1) + 
-  scale_color_identity() +
-  scale_x_continuous(limits = c(0, 1), expand = c(0, 0)) +
-  labs(
-    y = "Density"
-  ) +
-  theme(
-    panel.background = element_rect(color = "black", fill = "black"),
-    panel.grid = element_blank(),
-    axis.title = element_blank(),
-    axis.text = element_blank(),
-    axis.ticks = element_blank()
-  ) +
-  facet_wrap(~region, nrow = 1)
-
-lake_color_per_lake
-
-lake_color_per_lake %>% 
-  ggsave(filename = "figures/three_regions_lake_color_per_lake_20200205.png",
-         width = 15,
-         height = 6,
-         dpi = 100)
-
-## map mode color
-getmode <- function(v) {
-   uniqv <- unique(v)
-   uniqv[which.max(tabulate(match(v, uniqv)))]
-}
-
-color_mode = hue_density_lake %>% 
-  group_by(lake_id, region) %>% 
-  summarise(hue_mode = hue[which.max(density)],
-            clon = first(clon),
-            clat = first(clat)) %>% 
-  ungroup() %>% 
-  mutate(rgb_color = hsv(h = hue_mode, s = 1, v = 1))
-
-color_mode_sf = color_mode %>% 
-  st_as_sf(coords = c("clon", "clat"), crs = 4326)
-
-mapview::mapview(color_mode_sf, zcol = "hue_mode", color = hsv(h = seq(0.1311, 0.4514, length = 100), s = 1, v = 1), fill = NA)
-```
-
-
-## seasonality
-
-```{r}
-require(lubridate)
-
-doy_hue = dat %>% 
-  mutate(doy = yday(date)) %>% 
-  group_by(lake_id, doy) %>% 
-  summarise(mean_hue = mean(hue),
-            mean_sat = mean(saturation),
-            region = first(region),
-            date = first(date)) %>% 
-  ungroup()
-
-lake_color_seasonality = doy_hue %>% 
-  mutate(plotcolor = hsv(h = mean_hue, s = mean_sat, v = 0.7)) %>% 
-  ggplot() +
-  geom_point(aes(x = doy, y = mean_hue, group = lake_id, color = plotcolor), alpha = 0.7, size = 0.05) +
-  labs(x = "Day of the year",
-       y = "Hue") +
-  ylim(0, 0.75) +
-  scale_color_identity() +
-  facet_wrap(~region) +
-  theme(
-    # panel.background = element_rect(color = "black", fill = "black"),
-    # panel.grid = element_blank(),
-    # axis.title.y = element_blank(),
-    # axis.text.y = element_blank(),
-    # axis.ticks.y = element_blank()
-  )
-
-lake_color_seasonality
-
-lake_color_seasonality %>% 
-  ggsave(
-    filename = "figures/lake_color_seasonality_filtered_20200205.png",
-    width = 7,
-    height = 3,
-    dpi = 300
-  )
-
-## color index
-
-doy_hue_index = doy_hue %>% 
-  mutate(greenness = abs(mean_hue - 0.3),
-         blueness = abs(mean_hue - 0.6),
-         brownness = abs(mean_hue - 0.1))
-
-greenness_mw = doy_hue_index %>% 
-  filter(region == "Minnesota + Wisconsin") %>% 
-  ggplot() +
-  geom_smooth(aes(x = doy, y = greenness, group = lake_id), lwd = 0.1, se = F, show.legend = F, color = "darkgreen") +
-  geom_point(aes(doy, y = greenness), size = 0.1, alpha = 0.1) + 
-  geom_smooth(aes(x = doy, y = greenness), color = "green") +
-  scale_y_reverse(minor_breaks = NULL, breaks = c(0.025, 0.275), labels = c("More green", "Less green"), lim = c(0.3, 0)) +
-  labs(x = "Day of the year",
-       y = "Greenness (hue ref: 0.3)",
-       title = "Greenness for lakes from Minnesota + Wisconsin") +
-  theme(axis.text.y.left = element_text(angle = 90, hjust = 0.5),
-        axis.ticks.y = element_blank(),
-        panel.grid.major.y = element_blank())
-
-greenness_mw
-
-greenness_mw %>% ggsave(
-  filename = "figures/mw_greenness_20200205.png",
-  width = 8,
-  height = 5,
-  dpi = 300
-)
-
-brownness_mk = doy_hue_index %>% 
-  filter(region == "Mackenzie Delta") %>% 
-  ggplot() +
-  geom_smooth(aes(x = doy, y = brownness, group = lake_id), lwd = 0.1, se = F, show.legend = F, color = "brown") +
-  geom_point(aes(doy, y = brownness), size = 0.1, alpha = 0.2) + 
-  geom_smooth(aes(x = doy, y = brownness), color = "yellow") +
-  scale_y_reverse(minor_breaks = NULL, breaks = c(0.025, 0.475), labels = c("More brown", "Less brown")) +
-  labs(x = "Day of the year",
-       y = "Brownness (ref hue: 0.1)",
-       title = "Brownness for lakes from Mackenzie Delta") +
-  theme(axis.text.y.left = element_text(angle = 90, hjust = 0.5),
-        axis.ticks.y = element_blank(),
-        panel.grid.major.y = element_blank())
-
-brownness_mk
-
-brownness_mk %>% ggsave(
-  filename = "figures/mk_brownness_20200205.png",
-  width = 8,
-  height = 5,
-  dpi = 300
-)
-
-doy_hue_index %>% 
-  filter(region == "Tibetan Plateau") %>% 
-  ggplot() +
-  geom_smooth(aes(x = doy, y = blueness, group = lake_id), lwd = 0.1, se = F, show.legend = F, color = "darkblue") +
-  geom_point(aes(doy, y = blueness), size = 0.1, alpha = 0.3) + 
-  geom_smooth(aes(x = doy, y = blueness), color = "blue") +
-  # ylim(0, 0.3) +
-  labs(x = "Day of the year",
-       y = "Blueness")
-```
-
-## time series
-
-```{r}
-set.seed(2020)
-sublakes = dat %>% 
-  select(lake_id, region) %>% 
-  distinct() %>% 
-  group_by(region) %>% 
-  sample_n(100) %>% 
-  ungroup()
-
-sublakes %>%
-  left_join(dat, by = c("lake_id", "region")) %>% 
-  filter(date >= "2013-01-01") %>% 
-  mutate(plot_color = hsv(h = hue, s = 1, v = 1)) %>% 
-  ggplot(aes(x = date, y = hue, color = plot_color)) +
-  geom_line(aes(group = lake_id), lwd = 0.1, color = "black", alpha = 0.4) +
-  geom_point(size = 0.2) +
-  scale_color_identity() +
-  facet_wrap(~region, ncol = 1)
-```
-
-## monthly dominant colors
-
-```{r}
-require(lubridate)
-load("outputs/lake_color_three_regions_20200205.RData", verbose = T)
-
-monthly = dat %>% 
-  mutate(month = factor(month(date), levels = 1:12, labels = month.name)) %>% 
-  filter(date >= as.Date("2014-01-01"))
-
-monthly %>% 
-  filter(region == "Mackenzie Delta",
-         lake_id == 877) %>% 
-  ggplot() +
-  geom_density(aes(x = hue, color = month, group = month))
-  # geom_histogram(aes(x = hue, color = month))
-
-month_mod_color = monthly %>% 
-  group_by(lake_id, month) %>% 
+dat0 = datFil %>% 
+  dplyr::select(id, dwLehmann) %>% 
+  na.omit() %>% 
+  group_by(id) %>% 
   mutate(n = n()) %>% 
   ungroup() %>% 
-  filter(n > 2) %>% 
-  group_by(lake_id, month) %>% 
+  filter(n >= 20)
+
+dat0 %>% dplyr::select(id) %>% distinct()
+
+datMode = dat0 %>% 
+  group_by(id) %>% 
   do({
     dat = .
-    d = density(dat$hue)
-    tibble(mod_hue = d$x[which.max(d$y)]) %>% 
-      mutate(clon = dat$clon[1],
-             clat = dat$clat[1],
-             region = dat$region[1])
+    dwValues = dat %>% pull(dwLehmann)
+    dip = dwValues %>% dip.test()
+    d = dwValues %>% density()
+    mode = d$x[which.max(d$y)][1]
+      
+    dip[1:3] %>% as_tibble() %>% 
+      mutate(mode = mode, bw = d$bw, 
+             dwStd = sd(dwValues, na.rm = T),
+             interQ = (quantile(dwValues, probs = 0.75) - quantile(dwValues, probs = 0.25)) %>% as.numeric())
   }) %>% 
-  ungroup() %>% 
-  mutate(plotcolor = hsv(h = mod_hue, s = 1, v = 0.7, alpha = 0.3))
-
-save(month_mod_color, file = "monthly_mod_color.RData")
-
-
-require(ggmap)
-require(gganimate)
-
-region_bbox = month_mod_color %>% 
-  group_by(region) %>% 
-  summarise(lat_min = min(clat),
-            lat_max = max(clat),
-            lon_min = min(clon),
-            lon_max = max(clon)) %>% 
   ungroup()
 
-region_index = 3
+summary(datMode)
+datMode %>% dplyr::select(id) %>% distinct ## 110,160 lakes
 
-this_region_bbox = region_bbox[region_index, ]
-this_region = this_region_bbox$region
+## determine unimodal lakes
+datMode = datMode %>% 
+  mutate(unimodal = factor(p.value >= 0.05, levels = c(T, F), labels = c("Unimodal", "Non-unimodal")))
+### Bonferroni correction results in much fewer non-unimodal lakes
+datMode %>% 
+  mutate(unimodal = factor(p.value >= 0.05 / nrow(datMode), levels = c(T, F), labels = c("Unimodal", "Non-unimodal"))) %>% 
+  summary()
 
-map = get_stamenmap(c(
-  this_region_bbox$lon_min, 
-  this_region_bbox$lat_min, 
-  this_region_bbox$lon_max, 
-  this_region_bbox$lat_max), maptype = "terrain", zoom = 8)
+## add lake mean water occ
+meanLakeOcc = dir(path = "data/meanLakeOcc/", pattern = ".csv", include.dirs = T, full.names = T) %>% 
+  map(read_csv, col_types = "cn") %>% 
+  reduce(bind_rows)
 
-multipanel_map = ggmap(map, darken = c(0.7, "black")) +
-  geom_point(data = month_mod_color %>% 
-            filter(region == this_region), mapping = aes(x = clon, y = clat, color = plotcolor, group = month), alpha = 0.7) +
-  scale_color_identity() +
-  labs(title = paste("Lake color seasonality: ", this_region),
-     x = "Longitude",
-     y = "Latitude") +
-  facet_wrap(~month) +
-  theme(title = element_text(size = 14))
+summary(meanLakeOcc)
 
-# multipanel_map
+meanLakeOcc %>% dplyr::select(id) %>% distinct ## 150,559 lakes - 368 lakes
 
-multipanel_map %>% 
-  ggsave(filename = paste0("figs/", this_region, "_monthly_maps.png"), 
-         width = 10,
-         height = 8,
-         dpi = 300)
-
-g = ggmap(map, darken = c(0.7, "black")) +
-  geom_point(data = month_mod_color %>% 
-            filter(region == this_region), mapping = aes(x = clon, y = clat, color = plotcolor, group = month), alpha = 0.8) +
-  scale_color_identity() +
-  labs(title = "Lake color seasonality: {month.name[frame_time]}",
-       x = "Longitude",
-       y = "Latitude") +
-  transition_time(time = as.integer(month)) +
-  theme(title = element_text(size = 18))
-
-anim_save(filename = paste0(this_region, "_monthly_animation.gif"), animation = g, duration = 12, path = "figs", end_pause = 10)
-```
-
-## cluster analysis
-
-```{r}
-# https://www.statmethods.net/advstats/cluster.html
-
-load("outputs/lake_color_three_regions_20200205.RData", verbose = T)
-
-dat = dat %>%
-  filter(date >= as.Date("2010-01-17"))
-
-lake_info = dat %>% 
-  select(clon, clat, lake_id, region) %>% 
-  distinct()
-
-
-monthly_data = dat %>% 
-  mutate(month = factor(month(date), levels = 1:12, labels = month.abb)) %>%
-  group_by(lake_id, month) %>% 
-  mutate(n = n()) %>% 
-  ungroup() %>% 
-  filter(n > 2) %>% 
-  group_by(lake_id, month) %>% 
-  do({
-    dat = .
-    d = density(dat$hue)
-    tibble(mod_hue = d$x[which.max(d$y)]) %>% 
-      mutate(clon = dat$clon[1],
-             clat = dat$clat[1],
-             region = dat$region[1],
-             mean_hue = mean(dat$hue))
-  }) %>% 
-  ungroup() %>% 
-  mutate(hue = mean_hue)
-
-save(monthly_data, file = "outputs/monthly_data.RData")
-
-month_range = tibble(
-  region = c("Mackenzie Delta", "Minnesota + Wisconsin", "Tibetan Plateau"),
-  min_month = c(6, 4, 4),
-  max_month = c(9, 11, 12)
-)
-
-obs_monthly_dist = monthly_data %>% 
-  ggplot() +
-  geom_bar(aes(x = as.integer(month))) +
-  scale_x_continuous(breaks = 1:12, labels = month.abb) +
-  facet_wrap(~region, ncol = 1, scales = "free_y") +
-  labs(x = "",
-       y = "Count") +
-  geom_segment(data = month_range, aes(x = min_month, y = 0, xend = max_month, yend = 0), color = "green", lwd = 2)
-
-obs_monthly_dist
-
-obs_monthly_dist %>% 
-  ggsave(filename = "figs/obs_monthly_dist.png",
-         width = 7,
-         height = 7)
-  
-# this_region = "Mackenzie Delta"
-# this_region = "Minnesota + Wisconsin"
-this_region = "Tibetan Plateau"
-
-temp = month_range %>% filter(region == this_region)
-
-training = monthly_data %>% 
-  filter(region == this_region) %>% 
-  filter(as.integer(month) >= temp$min_month[1], as.integer(month) <= temp$max_month[1]) %>% 
-  select(month, hue, lake_id) %>% 
-  group_by(lake_id) %>% 
-  mutate(
-    mean_hue = mean(hue),
-    sd_hue = sd(hue),
-    hue_norm = (hue - mean_hue) / sd_hue,
-         ) %>% 
-  ungroup() %>% 
-  select(-hue) %>% 
-  spread(key = month, value = hue_norm, fill = NA) %>% 
+datMode = datMode %>% 
+  left_join(meanLakeOcc, by = "id") %>% 
   na.omit()
 
+datMode %>% dplyr::select(id) %>% distinct ## 110,090 lakes
 
-mean_sd = training %>% 
-  select(lake_id, mean_hue, sd_hue) %>% 
-  distinct()
-
-
-
-
-N = 3
-
-### kmeans cluster
-
-fit_kmeans = kmeans(training %>% select(-lake_id, -mean_hue, -sd_hue), N) # 5 cluster solution
-
-# plotcluster(training %>% select(-lake_id), fit$cluster)
-# library(cluster)
-# clusplot(training %>% select(-lake_id), fit$cluster, color = TRUE, shade = TRUE,
-#    labels = 0, lines = 0)
-
-clustered = training %>% 
-  mutate(class = fit_kmeans$cluster,
-         method = "K-means")
-  
-
-month_names = (fit_kmeans$centers %>% dimnames())[[2]]
-
-cluster_means = fit_kmeans$centers %>% 
-  t() %>% 
-  as_tibble() %>% 
-  bind_cols(tibble(month_nm = month_names)) %>% 
-  gather(key = "class", value = "hue", -month_nm) %>% 
-  inner_join(tibble(month = 1:12, month_nm = month.abb)) %>% 
-  mutate(method = "K-means")
-
-### DTW based clustering
-
-library(dtw)
-library(TSclust)
-library(dtwclust)
-library(zoo)
-
-training_dtw = training %>% 
-  select(-lake_id, -mean_hue, -sd_hue) %>% 
-  as.matrix()
-
-cluster_dtw = tsclust(training_dtw, type = "h", k = N, distance = "dtw_basic",
-                      centroid = dba, control =hierarchical_control(method = "complete"),
-                      preproc = NULL)
-
-## append class 
-
-clustered = clustered %>% 
-  bind_rows(clustered %>% 
-              mutate(class = cluster_dtw@cluster,
-                     method = "DTW"))
-clustered = clustered %>% mutate(class = as.character(class))
-
-## reconstruct cluster  mean
-centroids = cluster_dtw@centroids
-names(centroids) = paste0(1:N)
-centroids = as_tibble(centroids) %>% 
-  t() %>% 
-  as_tibble()
-names(centroids) = month_names
-centroids = centroids %>% 
-  mutate(class_dtw = 1:N) %>% 
-  gather(key = "month_nm", value = "hue", -class_dtw) %>% 
-  rename(class = class_dtw) %>% 
-  mutate(method = "DTW") %>% 
-  inner_join(tibble(month = 1:12, month_nm = month.abb), by = "month_nm")
-
-
-merged_means = centroids %>% 
-  mutate(class = as.character(class)) %>% 
-  bind_rows(cluster_means)
-
-# plot(cluster_dtw, type = "c", color = "grey") 
-# 
-# lake_id = training_all %>% 
-#   bind_cols(tibble(cluster_dtw = this_clustering@cluster))
-# 
-# this_clustering_mean = this_clustering@centroid
-
-## plot cluster results
-
-estimated_doy = merged_means %>% 
-  mutate(doy = yday(as.Date(paste0("2015-", month, "-15")))) %>% 
-  inner_join(clustered)
-
-cluster_center_fig = estimated_doy %>% 
-  ggplot(aes(x = month, y = hue, color = class)) +
-  geom_line(alpha = 0.7) +
-  geom_point(size = 2) +
-  facet_wrap(~method) +
-  labs(
-    x = "Month",
-    y = "Normalized Hue",
-    color = "Class"
-  )
-
-cluster_center_fig
-
-cluster_center_fig %>% 
-  ggsave(filename = paste0("figs/", this_region, "_cluster_center_fig.png"),
-         width = 7,
-         height = 5)
-
-dat_clustered = dat %>% 
-  select(lake_id, clat, clon, date, region, hue) %>% 
-  mutate(doy = yday(date)) %>% 
-  inner_join(clustered %>% 
-               select(lake_id, 
-                      class,
-                      method), by = "lake_id")
-
-doy_series_clustered = dat_clustered %>% 
-  ggplot(aes(x = doy, y = hue, group = lake_id, color = class)) +
-  geom_smooth(alpha = 0.2, lwd = 0.1, se = F) +
-  facet_grid(method~class) +
-  # scale_x_continuous(limits = c(150, 275)) +
-  scale_color_viridis_d(end = 0.8) +
-  labs(
-    x = "DOY",
-    y = "Hue",
-    color = "Class"
-  )
-
-doy_series_clustered
-
-doy_series_clustered %>% 
-  ggsave(
-    filename = paste0("figs/", this_region, "_doy_series_clustered.png"),
-    width = 8,
-    height = 6
-  )
-
-cluster_patterns = monthly_data %>%
-  filter(region == this_region) %>%
-  group_by(lake_id) %>%
-  mutate(hue_norm = (hue - mean(hue)) / sd(hue)) %>%
-  ungroup() %>%
-  inner_join(clustered %>% select(-mean_hue), by = "lake_id") %>%
-  ggplot() +
-  # geom_smooth(aes(x = month, y = hue_norm, group = lake_id), alpha = 0.2, size = 0.1, se = F, method = 'loess', formula = 'y ~ x') +
-  geom_line(aes(x = as.integer(month), y = hue_norm, group = lake_id), alpha = 0.5, size = 0.1) +
-  geom_line(data = merged_means, aes(x = month, y = hue, color = "Cluster mean")) +
-  geom_point(aes(x = as.integer(month), y = hue_norm), alpha = 0.1, size = 0.1) +
-  scale_x_continuous(limits = c(temp$min_month[1], temp$max_month[1])) +
-  facet_grid(method~class) +
-  labs(x = "Month",
-       y = "Normalized Hue",
-       color = "Legend") +
-  theme(legend.position = "bottom",
-        legend.direction = "horizontal")
-
-cluster_patterns
-
-cluster_patterns %>%
-  ggsave(filename = paste0("figs/", this_region, "_cluster_patterns.png"),
-         width = 8,
-         height = 8,
-         dpi = 300)
-
-## map
-
-region_bbox = dat %>% 
-  group_by(region) %>% 
-  summarise(lat_min = min(clat),
-            lat_max = max(clat),
-            lon_min = min(clon),
-            lon_max = max(clon)) %>% 
-  ungroup()
-
-require(ggmap)
-
-this_region_bbox = region_bbox[region_bbox$region == this_region, ]
-this_region = this_region_bbox$region
-
-map = get_stamenmap(c(
-  this_region_bbox$lon_min, 
-  this_region_bbox$lat_min, 
-  this_region_bbox$lon_max, 
-  this_region_bbox$lat_max), maptype = "terrain", zoom = 9)
-
-cluster_map = ggmap(map, darken = c(0.7, "black")) +
-  geom_point(data = clustered %>% 
-               inner_join(lake_info, by = "lake_id"), mapping = aes(x = clon, y = clat, color = class), alpha = 0.7) +
-  scale_color_viridis_d(end = 0.8) +
-  labs(title = paste("Lake color clusters: ", this_region),
-     x = "Longitude",
-     y = "Latitude",
-     color = "Cluster") +
-  facet_wrap(~method) +
-  theme(title = element_text(size = 12))
-
-cluster_map
-
-cluster_map %>% 
-  ggsave(filename = paste0("figs/", this_region, "_cluster_map.png"), 
-         width = 8,
-         height = 5,
-         dpi = 300)
-
-# merrged_map = cluster_map - doy_series_clustered +
-#   plot_layout(ncol = 1) +
-#   plot_annotation(tag_levels = "A")
-# 
-# merrged_map %>% 
-#   ggsave(filename = paste0("figs/", this_region, "_merrged_cluster_map.png"),
-#          width = 8,
-#          height = 8)
+write_csv(datMode, path = "outputs/datMode20_c2d77db60e960bbcd721fb580fa05896.csv")
+save(datMode, file = "outputs/datMode20_c2d77db60e960bbcd721fb580fa05896.RData")
 ```
 
-## temporal changes
+### Modal color distribution (AGU 2020 slides, distributions)
 
 ```{r}
-doy_hue_index = doy_hue %>% 
-  mutate(greenness = abs(mean_hue - 0.3),
-         blueness = abs(mean_hue - 0.6),
-         brownness = abs(mean_hue - 0.1))
+load("outputs/datMode20_c2d77db60e960bbcd721fb580fa05896.RData", verbose = T)
 
-## running window tibble
-window_size = 8
-increment = 5
+## modal color
 
-start_dates = seq(1984, 2020, by = increment)
-end_dates = start_dates + window_size
+h = hist(datMode$mode, breaks = 50)
+histdat = tibble(mids = h$mids, d = h$density)
+d = density(datMode$mode)
+dendat = tibble(dw = d$x, y = d$y)
 
-start_dates = as.Date(paste0(start_dates, "-01-01"))
-end_dates = as.Date(paste0(end_dates, "-01-01"))
+maxs = dendat %>% 
+  mutate(grp = cut(dw, breaks = c(380, 530, 600))) %>% 
+  group_by(grp) %>% 
+  summarise(dwmax = dw[which.max(y)],
+            ymax = y[which.max(y)]) %>% 
+  ungroup()
 
-windowed = tibble(start_dates, end_dates) %>% 
-  filter(end_dates <= as.Date("2020-01-01")) %>% 
-  mutate(label = paste0(year(start_dates), "-", year(end_dates) - 1)) %>% 
-  mutate(mean_year = floor((year(start_dates) + year(end_dates)) / 2)) %>% 
-  group_by(label) %>% 
+
+temp = dendat %>% filter(dw > 510, dw < 550)
+mins = temp %>% 
+  summarise(dwmin = dw[which.min(y)],
+            ymin = y[which.min(y)])
+
+summary(datMode$mode)
+
+modalColorDist = datMode %>% 
+  ggplot() + 
+  geom_bar(data = histdat, aes(x = mids, y = d), stat = "identity", fill = "lightgray", color = "white") +
+  geom_vline(data = maxs, aes(xintercept = dwmax), color = "grey20", lty = 3) +
+  geom_vline(data = mins, aes(xintercept = dwmin), color = "grey20", lty = 3) +
+  geom_density(aes(x = mode), fill = NA, color = "black") +
+  annotate("text", x = maxs$dwmax - 1, y = maxs$ymax + 0.005, angle = 90, label = paste0(format(maxs$dwmax, digits = 0), " nm"), hjust = 0, color = "black", vjust = 0) +
+  annotate("text", x = mins$dwmin - 1, y = mins$ymin + 0.005, angle = 90, label = paste0(format(mins$dwmin, digits = 0), " nm"), hjust = 0, color = "black", vjust = 0) +
+  scale_y_continuous(limits = c(0, 0.055), expand = expansion(mult = c(0, .05))) +
+  labs(x = "Modal lake center color (dominant wavelength: nm)",
+       y = "Density") +
+  theme_bw()
+
+modalColorDist
+
+modalColorDist %>% ggsave(filename = "figs/modalColorDist_c2d77db60e960bbcd721fb580fa05896.png",
+                          width = 6, height = 3, dpi = "print")
+
+### color comparing modal and instant
+dat0 = datFil %>% 
+  dplyr::select(id, dwLehmann) %>% 
+  na.omit() %>% 
+  group_by(id) %>% 
+  mutate(n = n()) %>% 
+  ungroup() %>% 
+  filter(n >= 20)
+
+
+modalColorDist = datMode %>% 
+  ggplot() + 
+  geom_density(data = dat0, aes(x = dwLehmann), fill = NA, color = "grey", lwd = 1.5) +
+  # geom_bar(data = histdat, aes(x = mids, y = d), stat = "identity", fill = "lightgray", color = "white") +
+  geom_vline(data = maxs, aes(xintercept = dwmax), color = "grey20", lty = 3) +
+  geom_density(aes(x = mode), fill = NA, color = "black", lwd = 1.5) +
+  annotate("text", x = maxs$dwmax - 1, y = maxs$ymax + 0.005, angle = 90, label = paste0(format(maxs$dwmax, digits = 0), " nm"), hjust = 0, color = "black", vjust = 0) +
+  scale_y_continuous(limits = c(0, 0.055), expand = expansion(mult = c(0, .05))) +
+  scale_x_continuous(limits = c(472.7, 587.7)) +
+  labs(x = "Modal lake center color (dominant wavelength: nm)",
+       y = "Density") +
+  theme_bw()
+
+modalColorDist
+
+modalColorDist %>% ggsave(filename = "figs/modalColorDist_2_c2d77db60e960bbcd721fb580fa05896.png",
+                          width = 6, height = 3, dpi = "print")
+
+
+### distribution of color variation
+
+h = hist(datMode$dwStd, breaks = 50)
+histdat = tibble(mids = h$mids, d = h$density)
+d = density(datMode$dwStd)
+dendat = tibble(dw = d$x, y = d$y)
+
+maxs = dendat %>% 
+  mutate(grp = cut(dw, breaks = c(-1, 10, 60))) %>% 
+  group_by(grp) %>% 
+  summarise(dwmax = dw[which.max(y)],
+            ymax = y[which.max(y)]) %>% 
+  ungroup() %>% 
+  na.omit()
+
+temp = dendat %>% filter(dw > 4, dw < 20)
+mins = temp %>% 
+  summarise(dwmin = dw[which.min(y)],
+            ymin = y[which.min(y)])
+
+std_dist = datMode %>% 
+  ggplot() + 
+  geom_bar(data = histdat, aes(x = mids, y = d), stat = "identity", fill = "lightgray", color = "white") +
+  geom_vline(data = maxs, aes(xintercept = dwmax), color = "grey20", lty = 3) +
+  geom_vline(data = mins, aes(xintercept = dwmin), color = "grey20", lty = 3) +
+  geom_density(aes(x = dwStd), fill = NA, color = "black") +
+  annotate("text", x = maxs$dwmax - 0.5, y = maxs$ymax + 0.005, angle = 90, label = paste0(format(maxs$dwmax, digits = 0), " nm"), hjust = 0, color = "black", vjust = 0) +
+  annotate("text", x = mins$dwmin - 0.5, y = mins$ymin + 0.005, angle = 90, label = paste0(format(mins$dwmin, digits = 0), " nm"), hjust = 0, color = "black", vjust = 0) +
+  scale_y_continuous(limits = c(0, 0.06), expand = expansion(mult = c(0, .05))) +
+  labs(x = "Lake center color standard deviation (dominant wavelength: nm)",
+       y = "Density") +
+  theme_bw()
+
+std_dist
+
+std_dist %>% ggsave(filename = "figs/std_dist_c2d77db60e960bbcd721fb580fa05896.png",
+                          width = 6, height = 3, dpi = "print")
+
+
+
+### std distribution for color groups
+
+h = hist(datMode$dwStd, breaks = 50)
+histdat = tibble(mids = h$mids, d = h$density)
+d = density(datMode$dwStd)
+dendat = tibble(dw = d$x, y = d$y)
+
+temp = dendat %>% filter(dw > 4, dw < 20)
+mins = temp %>% 
+  summarise(dwmin = dw[which.min(y)],
+            ymin = y[which.min(y)])
+
+std_dist_groups = datMode %>% 
+  mutate(colorGrp = cut(mode, breaks = c(390, 530, 600), include.lowest = T, labels = c("Blue lakes", "Yellow lakes"))) %>% 
+  ggplot() + 
+  geom_bar(data = histdat, aes(x = mids, y = d), stat = "identity", fill = "lightgrey", color = "white") +
+  # geom_density(data = datMode, aes(x = dwStd), color = "black", alpha = 1, fill = NA) +
+  geom_density(aes(x = dwStd, color = colorGrp), alpha = 1, lwd = 1, show.legend = F) +
+  geom_density(data = datMode, aes(x = dwStd), color = "black", alpha = 1, fill = NA, lwd = 1) +
+  geom_vline(data = mins, aes(xintercept = dwmin), color = "grey20", lty = 3) +
+  annotate("text", x = mins$dwmin - 0.5, y = mins$ymin + 0.005, angle = 90, label = paste0(format(mins$dwmin, digits = 0), " nm"), hjust = 0, color = "black", vjust = 0) +
+  scale_y_continuous(limits = c(0, 0.07), expand = expansion(mult = c(0, .05))) +
+  labs(x = "Lake center color standard deviation (dominant wavelength: nm)",
+       y = "Density",
+       color = "Modal color group") +
+  scale_color_discrete(direction = -1) +
+  theme_bw()
+
+std_dist_groups
+
+std_dist_groups %>% ggsave(filename = "figs/std_dist_groups_2_c2d77db60e960bbcd721fb580fa05896.png",
+                          width = 6, height = 3, dpi = "print")
+
+
+```
+
+
+### Map lake modal color and other parameters (AGU 2020 maps)
+```{r}
+# require(raster)
+require(rnaturalearthdata)
+
+colorGen = function() {
+    return(c('#610061', '#640066', '#67006A', '#6A006F', '#6D0073', '#6F0077', '#72007C', '#740080', '#760084', '#780088', '#79008D', '#7B0091', '#7C0095', '#7E0099', '#7F009D', '#8000A1', '#8100A5', '#8100A9', '#8200AD', '#8200B1', '#8300B5', '#8300B9', '#8300BC', '#8300C0', '#8200C4', '#8200C8', '#8100CC', '#8100CF', '#8000D3', '#7F00D7', '#7E00DB', '#7C00DE', '#7B00E2', '#7900E6', '#7800E9', '#7600ED', '#7400F1', '#7100F4', '#6F00F8', '#6D00FB', '#6A00FF', '#6600FF', '#6100FF', '#5D00FF', '#5900FF', '#5400FF', '#5000FF', '#4B00FF', '#4600FF', '#4200FF', '#3D00FF', '#3800FF', '#3300FF', '#2E00FF', '#2800FF', '#2300FF', '#1D00FF', '#1700FF', '#1100FF', '#0A00FF', '#0000FF', '#000BFF', '#0013FF', '#001BFF', '#0022FF', '#0028FF', '#002FFF', '#0035FF', '#003BFF', '#0041FF', '#0046FF', '#004CFF', '#0051FF', '#0057FF', '#005CFF', '#0061FF', '#0066FF', '#006CFF', '#0071FF', '#0076FF', '#007BFF', '#007FFF', '#0084FF', '#0089FF', '#008EFF', '#0092FF', '#0097FF', '#009CFF', '#00A0FF', '#00A5FF', '#00A9FF', '#00AEFF', '#00B2FF', '#00B7FF', '#00BBFF', '#00C0FF', '#00C4FF', '#00C8FF', '#00CDFF', '#00D1FF', '#00D5FF', '#00DAFF', '#00DEFF', '#00E2FF', '#00E6FF', '#00EAFF', '#00EFFF', '#00F3FF', '#00F7FF', '#00FBFF', '#00FFFF', '#00FFF5', '#00FFEA', '#00FFE0', '#00FFD5', '#00FFCB', '#00FFC0', '#00FFB5', '#00FFA9', '#00FF9E', '#00FF92', '#00FF87', '#00FF7B', '#00FF6E', '#00FF61', '#00FF54', '#00FF46', '#00FF38', '#00FF28', '#00FF17', '#00FF00', '#09FF00', '#0FFF00', '#15FF00', '#1AFF00', '#1FFF00', '#24FF00', '#28FF00', '#2DFF00', '#31FF00', '#36FF00', '#3AFF00', '#3EFF00', '#42FF00', '#46FF00', '#4AFF00', '#4EFF00', '#52FF00', '#56FF00', '#5AFF00', '#5EFF00', '#61FF00', '#65FF00', '#69FF00', '#6CFF00', '#70FF00', '#73FF00', '#77FF00', '#7BFF00', '#7EFF00', '#81FF00', '#85FF00', '#88FF00', '#8CFF00', '#8FFF00', '#92FF00', '#96FF00', '#99FF00', '#9CFF00', '#A0FF00', '#A3FF00', '#A6FF00', '#A9FF00', '#ADFF00', '#B0FF00', '#B3FF00', '#B6FF00', '#B9FF00', '#BDFF00', '#C0FF00', '#C3FF00', '#C6FF00', '#C9FF00', '#CCFF00', '#CFFF00', '#D2FF00', '#D5FF00', '#D8FF00', '#DBFF00', '#DEFF00', '#E1FF00', '#E4FF00', '#E7FF00', '#EAFF00', '#EDFF00', '#F0FF00', '#F3FF00', '#F6FF00', '#F9FF00', '#FCFF00', '#FFFF00', '#FFFC00', '#FFF900', '#FFF600', '#FFF200', '#FFEF00', '#FFEC00', '#FFE900', '#FFE600', '#FFE200', '#FFDF00', '#FFDC00', '#FFD900', '#FFD500', '#FFD200', '#FFCF00', '#FFCB00', '#FFC800', '#FFC500', '#FFC100', '#FFBE00', '#FFBB00', '#FFB700', '#FFB400', '#FFB000', '#FFAD00', '#FFA900', '#FFA600', '#FFA200', '#FF9F00', '#FF9B00', '#FF9800', '#FF9400', '#FF9100', '#FF8D00', '#FF8900', '#FF8600', '#FF8200', '#FF7E00', '#FF7B00', '#FF7700', '#FF7300', '#FF6F00', '#FF6B00', '#FF6700', '#FF6300', '#FF5F00', '#FF5B00', '#FF5700', '#FF5300', '#FF4F00', '#FF4B00', '#FF4600', '#FF4200', '#FF3E00', '#FF3900', '#FF3400', '#FF3000', '#FF2B00', '#FF2600', '#FF2100', '#FF1B00', '#FF1600', '#FF1000', '#FF0900', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000'))}
+colors = colorGen()
+dt_projection = "+proj=robin +lon_0=0 +datum=WGS84 +units=m +no_defs" 
+
+cl = rnaturalearthdata::countries50 %>% 
+  st_as_sf() %>% 
+  filter(continent != "Antarctica") %>% 
+  st_transform(dt_projection) %>% 
+  st_union()
+
+bounds = st_bbox(cl)
+
+load("outputs/datMode20_c2d77db60e960bbcd721fb580fa05896.RData", verbose = T)
+lakeData = st_read(dsn = "outputs/lake_samples_jida_05172020.shp")
+lakeData = lakeData %>% st_transform(crs = dt_projection)
+lakeData = lakeData %>% mutate(size = st_area(geometry))
+
+## lake modal color
+
+lakeParam = lakeData %>% 
+    left_join(datMode, by = "id") %>% 
+    na.omit() %>% 
+    arrange(desc(size)) %>% 
+    dplyr::select(mode)
+  
+colorRaster = stars::st_rasterize(sf = lakeParam, nx = 3000, ny = 2000, options = c("ALL_TOUCHED=TRUE", "MERGE_ALG=REPLACE"))
+  
+globalColorMap = ggplot() +
+  geom_sf(data = cl, color = NA, fill = "black") +
+  geom_stars(data = colorRaster) +
+  scale_fill_gradientn(limits = c(450, 600), colours = colors[71:221], na.value='#FFFFFF00',
+                       guide = guide_colorbar(title = "Modal dominant wavelength (nm)", title.position = "top", title.hjust = 0, barwidth = 15, barheight = 0.4)) +
+  coord_sf(crs = dt_projection, expand = F, xlim = bounds[c(1, 3)], ylim = bounds[c(2, 4)]) +
+  theme(legend.position = "bottom",
+        legend.direction = "horizontal",
+        panel.background = element_rect(fill = NA, color = NA),
+        panel.grid = element_blank(),
+        axis.text.x = element_blank(),
+        axis.text.y = element_blank(),
+        axis.title.y = element_blank(),
+        axis.title.x = element_blank(), 
+        axis.ticks.y = element_blank(),
+        axis.ticks.x = element_blank())
+
+globalColorMap
+
+globalColorMap %>% ggsave(filename = "figs/globalLakeModalColor_2bb54406aeffd6b652123878457838eb.png", width = 7, height = 4, dpi = "print")
+
+
+
+## lake std modal color
+
+lakeParam = lakeData %>% 
+    left_join(datMode, by = "id") %>% 
+    na.omit() %>% 
+    arrange(desc(size)) %>% 
+    dplyr::select(dwStd)
+
+hist(lakeParam$dwStd)
+  
+colorRaster = stars::st_rasterize(sf = lakeParam, nx = 3000, ny = 2000, options = c("ALL_TOUCHED=TRUE", "MERGE_ALG=REPLACE"))
+  
+globalColorMap = ggplot() +
+  geom_sf(data = cl, color = NA, fill = "black") +
+  geom_stars(data = colorRaster) +
+  scale_fill_viridis_c(limits = c(0, 30), option = "plasma", begin = 0.4, na.value='#FFFFFF00',
+                       guide = guide_colorbar(title = "Standard deviation dominant wavelength (nm)", title.position = "top", title.hjust = 0, barwidth = 15, barheight = 0.4), oob = scales::squish) +
+  coord_sf(crs = dt_projection, expand = F, xlim = bounds[c(1, 3)], ylim = bounds[c(2, 4)]) +
+  theme(legend.position = "bottom",
+        legend.direction = "horizontal",
+        panel.background = element_rect(fill = NA, color = NA),
+        panel.grid = element_blank(),
+        axis.text.x = element_blank(),
+        axis.text.y = element_blank(),
+        axis.title.y = element_blank(),
+        axis.title.x = element_blank(), 
+        axis.ticks.y = element_blank(),
+        axis.ticks.x = element_blank())
+
+globalColorMap
+
+globalColorMap %>% ggsave(filename = "figs/globalLakeStdColor_2bb54406aeffd6b652123878457838eb.png", width = 7, height = 4, dpi = "print")
+
+
+## lake unimodality
+
+lakeParam = lakeData %>% 
+  left_join(datMode, by = "id") %>% 
+  na.omit() %>% 
+  arrange(desc(size)) %>% 
+  dplyr::select(unimodal) %>% 
+  mutate(unimodal = as.integer(unimodal == "Unimodal"))
+
+hist(lakeParam$unimodal)
+  
+colorRaster = stars::st_rasterize(sf = lakeParam, nx = 3000, ny = 2000, options = c("ALL_TOUCHED=TRUE", "MERGE_ALG=REPLACE"))
+  
+globalColorMap = ggplot() +
+  geom_sf(data = cl, color = NA, fill = "black") +
+  geom_stars(data = cut(colorRaster, breaks = c(0, 0.5, 1), include.lowest = T, labels = c("Nonunimodal", "Unimodal"))) +
+  scale_fill_manual(values = c("cyan", "red"), na.value='#FFFFFF00',
+                       guide = guide_legend(title = "Unimodality", title.position = "top", title.hjust = 0)) +
+  coord_sf(crs = dt_projection, expand = F, xlim = bounds[c(1, 3)], ylim = bounds[c(2, 4)]) +
+  theme(legend.position = "bottom",
+        legend.direction = "horizontal",
+        panel.background = element_blank(),
+        panel.grid = element_line(color = "lightgrey"),
+        axis.text.y = element_blank(),
+        axis.title.y = element_blank(),
+        axis.title.x = element_blank(), 
+        axis.ticks.y = element_blank(),
+        axis.ticks.x = element_line(color = "grey"),
+        axis.text = element_text(color = "grey"), 
+        plot.title = element_text(hjust = 0.5))
+
+globalColorMap
+
+globalColorMap %>% ggsave(filename = "figs/globalLakeUnimodal_2bb54406aeffd6b652123878457838eb.png", width = 7, height = 4, dpi = "print")
+
+
+## lake member
+
+datModeGroup = datMode %>% 
+  mutate(modeGrp = cut(mode, breaks = c(300, 526, 600), labels = c("blue", "yellow")),
+         dwStdGrp = cut(dwStd, breaks = c(0, 9, 50), labels = c("stable", "variable")),
+         group = forcats::fct_cross(modeGrp, dwStdGrp)) %>% 
+  dplyr::select(group, id)
+
+datModeGroup %>% dplyr::select(group) %>% mutate(int = as.numeric(group)) %>% distinct
+
+datModeGroup = datModeGroup %>% mutate(group = as.numeric(group))
+
+lakeParam = lakeData %>% 
+  left_join(datModeGroup, by = "id") %>% 
+  na.omit() %>% 
+  arrange(desc(size)) %>% 
+  dplyr::select(group)
+
+hist(lakeParam$group)
+  
+colorRaster = stars::st_rasterize(sf = lakeParam, nx = 3000, ny = 2000, options = c("ALL_TOUCHED=TRUE", "MERGE_ALG=REPLACE")) %>% 
+  cut(breaks = c(1, 1.5, 2.5, 3.5, 4), include.lowest = T, labels = c("Blue:Stable", "Yellow:Stable", "Blue:Variable", "Yellow:Variable"))
+  
+globalColorMap = ggplot() +
+  geom_sf(data = cl, color = NA, fill = "black") +
+  geom_stars(data = colorRaster) +
+  scale_fill_manual(values = c("cyan", "orange", "lightblue", "yellow"), na.value='#FFFFFF00',
+                       guide = guide_legend(title = "Lake groups", title.position = "top", title.hjust = 0)) +
+  coord_sf(crs = dt_projection, expand = F, xlim = bounds[c(1, 3)], ylim = bounds[c(2, 4)]) +
+  theme(legend.position = "bottom",
+        legend.direction = "horizontal",
+        panel.background = element_rect(fill = NA, color = NA),
+        panel.grid = element_blank(),
+        axis.text.x = element_blank(),
+        axis.text.y = element_blank(),
+        axis.title.y = element_blank(),
+        axis.title.x = element_blank(), 
+        axis.ticks.y = element_blank(),
+        axis.ticks.x = element_blank())
+
+globalColorMap
+
+globalColorMap %>% ggsave(filename = "figs/globalLakeGroups_2bb54406aeffd6b652123878457838eb.png", width = 7, height = 4, dpi = "print")
+```
+
+
+
+## Group lakes
+
+### Assign groups, export for GEE app
+
+```{r}
+load("outputs/datMode20_c2d77db60e960bbcd721fb580fa05896.RData", verbose = T)
+
+datModeGroup = datMode %>% 
+  mutate(modeGrp = cut(mode, breaks = c(300, 526, 600), labels = c("blue", "yellow")),
+         dwStdGrp = cut(dwStd, breaks = c(0, 9, 50), labels = c("stable", "variable")),
+         nobsGrp = cut(nobs, breaks = c(20, 40, 400), include.lowest = T, labels = c("[20, 40]", "(40, 400]")),
+         group = forcats::fct_cross(modeGrp, dwStdGrp)) %>% 
+  dplyr::select(-modeGrp, -dwStdGrp)
+
+datModeGroup %>% 
+  sample_n(30000) %>% 
+  ggplot() +
+  geom_point(aes(x = mode, y = dwStd, color = group), alpha = 0.3, size = 0.1)
+
+save(datModeGroup, file = "outputs/datModeGroup_assigned_c2d77db60e960bbcd721fb580fa05896.RData")
+
+write_csv(datModeGroup %>% mutate(groupInt = as.numeric(group)), path = "outputs/datModeGroup_assigned_c2d77db60e960bbcd721fb580fa05896.csv")
+```
+
+## Assign lake land cover attributes
+
+### import GLCP
+
+```{r}
+## note: it takes 1hr to import the dataset
+n = 1
+j = 0
+while(n != 0) {
+  temp = read_csv(file = "~/Downloads/glcp.csv", col_types = "if----ff-nnn--n", n_max = 100000, skip = j * 100000, col_names = c("year", "Hylak_id", "bsn_lvl", "HYBAS_ID", "total_precip_mm", "mean_annual_temp_k", "pop_sum", "total_km2")) %>% 
+    filter(year == 2015)
+  n = nrow(temp)
+  
+  print(paste("index: ", j, "has n records: ", n))
+  
+  if (j==0) {
+    glcp = temp
+  } else {
+    glcp = bind_rows(glcp, temp)
+  }
+  j = j + 1
+}
+
+save(glcp, file = "outputs/glcp_2015.RData")
+```
+
+### Link UCLA lakes to HydroLAKES
+```{r}
+require(sf)
+lakeSampleDp = st_read("outputs/lakeSample_Dp.geojson")
+hl = st_read(dsn = "~/Google_Drive/Map layers/HydroLAKES_polys_v10_shp/HydroLAKES_polys_v10_shp/HydroLAKES_polys_v10.shp")
+
+lakeSampleHylakId = lakeSampleDp %>% 
+  st_join(hl %>% select(Hylak_id, Res_time, Elevation, Depth_avg, Lake_area, Shore_dev, Lake_type), left = T) %>% 
+  mutate(dp_lon = st_coordinates(geometry)[, 1], dp_lat = st_coordinates(geometry)[, 2]) %>% 
+  st_drop_geometry() %>% 
+  as_tibble()
+
+print("How many lakes in lakeSampleDp?")
+nrow(lakeSampleDp)
+print("How many intersect with HydroLAKES?")
+nrow(lakeSampleHylakId %>% filter(!is.na(Hylak_id)))
+
+remove(lakeSampleDp, hl)
+summary(lakeSampleHylakId)
+#!!! we lost 30000 lakes when matching dp with hydroLakes, why?
+
+save(lakeSampleHylakId, file = "outputs/lakeSampleHylakId.RData")
+```
+
+### Connect hydrobasins id to hydrolake id
+
+```{r}
+load("outputs/lakeSampleHylakId.RData", verbose = T)
+load("outputs/glcp_2015.RData", verbose = T)
+pfaf = read_csv("data/hb_pfafcode_a195a69532ff13b8b62562806235e9ef.csv") %>% 
+  mutate(HYBAS_ID = as.character(HYBAS_ID), PFAF_ID = as.character(PFAF_ID))
+
+glcp %>% ggplot() + geom_bar(aes(x = bsn_lvl))
+
+connectedIds = lakeSampleHylakId %>% select(id, Hylak_id) %>% na.omit() %>% distinct %>% # 119,775 lakes were linked
+  left_join(glcp %>% select(Hylak_id, bsn_lvl, HYBAS_ID) %>% mutate(Hylak_id = as.integer(as.character(Hylak_id))), by = "Hylak_id") %>% na.omit() # 119,630 non-na matchups
+
+connectedIds
+
+# connect id to hydrobasin pfaf id
+id2pfaf = connectedIds %>% 
+  mutate(HYBAS_ID = as.character(HYBAS_ID)) %>% 
+  left_join(pfaf, by = "HYBAS_ID") %>% 
+  select(id, PFAF_ID, HYBAS_ID) %>% 
+  filter(!is.na(PFAF_ID))
+  distinct()
+  
+nrow(id2pfaf)
+
+id2pfaf %>% mutate(lvl = nchar(PFAF_ID)) %>% ggplot() + geom_bar(aes(lvl)) + scale_x_continuous(breaks = 1:12) + labs(x = "Pfaf level", y = "Count") + ggsave(filename = "figs/Pfaf distribution UCLA lakes.png", width = 5, height = 4)
+
+save(id2pfaf, file = "outputs/ucla_lake_id_2_pfaf_id.RData")
+```
+
+### Land cover fraction at lvl 12
+
+```{r}
+## read in basin scale data
+
+datBasin = dir("~/Google_Drive_morphologee1/Lake basin land cover", full.names = T) %>% 
+  map(read_csv) %>% 
+  reduce(rbind)
+
+datBasin %>% na.omit() %>% select(HYBAS_ID) %>% distinct() %>% nrow
+  
+datBasin = datBasin %>% 
+  transmute(
+    HYBAS_ID = HYBAS_ID,
+    total_area = total_area,
+    lc_bare = bare_60 / total_area,
+    cropland = cropland_40 / total_area,
+    pwater = pwater_80 / total_area,
+    snowIce = snowIce_70 / total_area,
+    urban = urban_50 / total_area
+  )
+  
+datBasin %>% summary()
+
+save(datBasin, file = "outputs/basinLandCover_dd69dc1edce7dc8f026d0ac26d83389a.RData")
+```
+
+### Attribute land cover data to lakes
+```{r}
+load("outputs/basinLandCover_dd69dc1edce7dc8f026d0ac26d83389a.RData", verbose = T)
+load("outputs/ucla_lake_id_2_pfaf_id.RData", verbose = T)
+
+datBasin = datBasin %>% mutate(HYBAS_ID = as.character(HYBAS_ID)) %>% left_join(pfaf, by = "HYBAS_ID")
+
+pfaf12 = pfaf %>% filter(nchar(PFAF_ID) == 12)
+
+## for lvl 12 lakes, direct join
+landcover_lvl12 = id2pfaf %>% 
+  filter(nchar(PFAF_ID) == 12) %>% 
+  left_join(datBasin %>% select(-HYBAS_ID), by = "PFAF_ID")
+
+landcover_lvl12 %>% filter(is.na(total_area)) %>% nrow()
+
+## for lvls other than 12
+landcover_lvl_lt12 = id2pfaf %>% 
+  mutate(lvl = nchar(PFAF_ID)) %>% 
+  filter(lvl != 12) %>% 
+  select(PFAF_ID) %>% 
+  distinct() %>% 
+  # sample_n(size = 10) %>% 
+  group_by(PFAF_ID) %>% 
   do({
     dat = .
-    doy_hue_index %>% 
-      filter(date <= dat$end_dates[1], date >= dat$start_dates[1]) %>% 
-      mutate(
-        start_date = dat$start_dates[1],
-        end_date = dat$end_dates[1], 
-        mean_year = dat$mean_year[1])
+
+    thisPfaf = dat$PFAF_ID[1]
+    thisLvl = nchar(thisPfaf)
+    
+    temp = pfaf12 %>% filter(substr(PFAF_ID, start = 1, stop = thisLvl) == thisPfaf) %>% 
+      left_join(datBasin %>% select(-HYBAS_ID), by = "PFAF_ID") %>% 
+      rename(child_PFAF_ID = PFAF_ID) %>% 
+      summarise(
+        lc_bare = weighted.mean(x = lc_bare, w = total_area, na.rm = T),
+        cropland = weighted.mean(x = cropland, w = total_area, na.rm = T),
+        pwater = weighted.mean(x = pwater, w = total_area, na.rm = T),
+        snowIce = weighted.mean(x = snowIce, w = total_area, na.rm = T),
+        urban = weighted.mean(x = urban, w = total_area, na.rm = T),
+        p_missing = sum(is.na(total_area)) / n(),
+        total_area = sum(total_area, na.rm = T)
+        )
+    
+    temp
   }) %>% 
   ungroup()
 
+save(landcover_lvl_lt12, landcover_lvl12, file = "outputs/landcover_alllvls.RData")
 
-windowed %>% 
-  ggplot() +
-  geom_bar(aes(x = label, fill = region), position = "dodge") +
-  theme(axis.text.x.bottom = element_text(angle = 45, hjust = 1))
-# plot the data
+landcover_lvl_lt12 %>% ggplot() + geom_histogram(aes(p_missing))
 
-greenness_mw = windowed %>% 
-  filter(region == "Minnesota + Wisconsin") %>% 
-  ggplot() +
-  # geom_smooth(aes(x = doy, y = greenness, group = lake_id), lwd = 0.1, se = F, show.legend = F, color = "darkgreen") +
-  # geom_point(aes(doy, y = greenness), size = 0.1, alpha = 0.1) + 
-  geom_smooth(aes(x = doy, y = greenness, color = mean_year, group = mean_year)) +
-  scale_y_reverse(minor_breaks = NULL, breaks = c(0.025, 0.275), labels = c("More green", "Less green"), lim = c(0.3, 0)) +
-  labs(x = "Day of the year",
-       y = "Greenness (hue ref: 0.3)",
-       title = "Greenness for lakes from Minnesota + Wisconsin",
-       color = "Centered year") +
-  theme(axis.text.y.left = element_text(angle = 90, hjust = 0.5),
-        axis.ticks.y = element_blank(),
-        panel.grid.major.y = element_blank()) +
-  scale_color_viridis_c()
+landcover_lvl_lt12 %>% na.omit() %>% nrow()
 
-greenness_mw
-
-greenness_mw %>% ggsave(
-  filename = "figures/mw_greenness_20200207_temporal.png",
-  width = 8,
-  height = 5,
-  dpi = 300
-)
-
-
-brownness_mk = windowed %>% 
-  filter(region == "Mackenzie Delta") %>% 
-  ggplot() +
-  # geom_smooth(aes(x = doy, y = greenness, group = lake_id), lwd = 0.1, se = F, show.legend = F, color = "darkgreen") +
-  # geom_point(aes(doy, y = greenness), size = 0.1, alpha = 0.1) + 
-  geom_smooth(aes(x = doy, y = brownness, color = mean_year, group = mean_year)) +
-  scale_y_reverse(minor_breaks = NULL, breaks = c(0.025, 0.275), labels = c("More brown", "Less brown"), lim = c(0.3, 0)) +
-  labs(x = "Day of the year",
-       y = "Brownness (hue ref: 0.1)",
-       title = "Brownness for lakes from Mackenzie Delta",
-       color = "Centered year") +
-  theme(axis.text.y.left = element_text(angle = 90, hjust = 0.5),
-        axis.ticks.y = element_blank(),
-        panel.grid.major.y = element_blank()) +
-  scale_color_viridis_c()
-
-brownness_mk
-
-brownness_mk %>% ggsave(
-  filename = "figures/mk_brownness_20200205_temporal.png",
-  width = 8,
-  height = 5,
-  dpi = 300
-)
-
-
-
-
-lake_id_sample = windowed %>% 
-  filter(region == "Minnesota + Wisconsin") %>% 
-  select(lake_id) %>% 
+landcover_largelakes = id2pfaf %>% 
+  mutate(lvl = nchar(PFAF_ID)) %>% 
+  filter(lvl != 12) %>% 
+  left_join(landcover_lvl_lt12 %>% na.omit(), by = "PFAF_ID") %>% 
+  filter(!is.na(total_area)) %>% 
   distinct() %>% 
-  sample_n(10)
+  filter(p_missing < 0.1)
 
-windowed %>% 
-  filter(region == "Minnesota + Wisconsin") %>% 
-  right_join(lake_id_sample, by = "lake_id") %>% 
-  ggplot() +
-  geom_smooth(aes(x = doy, y = greenness, color = mean_year, group = mean_year), lwd = 0.3, se = F) +
-  # geom_point(aes(doy, y = greenness), size = 0.1, alpha = 0.1) + 
-  # geom_smooth(aes(x = doy, y = greenness, color = mean_year, group = mean_year)) +
-  scale_y_reverse(minor_breaks = NULL, breaks = c(0.025, 0.275), labels = c("More green", "Less green"), lim = c(0.3, 0)) +
-  labs(x = "Day of the year",
-       y = "Greenness (hue ref: 0.3)",
-       title = "Greenness for lakes from Minnesota + Wisconsin",
-       color = "Centered year") +
-  theme(axis.text.y.left = element_text(angle = 90, hjust = 0.5),
-        axis.ticks.y = element_blank(),
-        panel.grid.major.y = element_blank()) +
-  scale_color_viridis_c() +
-  facet_wrap(~lake_id)
+landcover_largelakes %>% select(PFAF_ID) %>% distinct()
+
+landcover_ucla_lakes = landcover_lvl12 %>% 
+  bind_rows(landcover_largelakes %>% select(-lvl, -p_missing))
+
+save(landcover_lvl_lt12, landcover_lvl12, landcover_ucla_lakes, file = "outputs/landcover_alllvls.RData")
 ```
 
-
-
-## time series spectral analysis
+## Assign climate variables
 
 ```{r}
-require(spectral)
+era5lake = dir("data/lakeTempPrecip", full.names = T) %>% 
+  map(read_csv, col_types = "cnnnn") %>% 
+  reduce(bind_rows)
+```
 
-this_lake = dat %>% 
-  filter(region == "Minnesota + Wisconsin",
-         lake_id == 110) %>% 
-  mutate(t = as.integer(date - as.Date("1983-01-01")) / 365.25)
+## Assign lake physical parameters
 
-ymean = mean(this_lake$hue)
+```{r}
+lakeMeta = read_csv("outputs/lake_meta_v2.csv", col_types = "iccnnc")
+```
 
-this_lake = this_lake %>% 
-  mutate(y = hue - ymean)
+## Merge attributes, excluding landcover and hydrolake attributes
 
-this_lake %>% ggplot() + geom_point(aes(yday(date), hue))
-this_lake %>% ggplot() + geom_line(aes(t, hue), color = "grey") + geom_point(aes(t, hue))
+```{r}
+load("outputs/datModeGroup_assigned_c2d77db60e960bbcd721fb580fa05896.RData", verbose = T)
+load("outputs/lakeSampleHylakId.RData", verbose = T)
 
-periodogram = spec.lomb(x = this_lake$t, y = this_lake$y, ofac = 20, mode = "generalized")
+datModeGroup %>% nrow() # 110,090 lakes
 
-plot(periodogram)
+## climate data
+merged = datModeGroup %>% inner_join(era5lake, by = "id")
+nrow(merged) # 110,090 lakes
 
-# select a frequency range
-m = c(0.02, 4)
-# select and reconstruct the most significant component
-l2 = filter.lomb(periodogram, newx = seq(0, 35.5, length = 1000), filt = m, threshold = 6)
+## physical parameters
+merged = merged %>% inner_join(lakeMeta, by = "id")
+merged = merged %>% filter(!is.na(class))
+nrow(merged) # 103,654 lakes (7,250 lakes don't have class and volumn values)
 
-plot(this_lake$t, this_lake$y, type = "p")
-lines(this_lake$t, this_lake$y)
-lines(l2$x, l2$y, col = "red")
+write_csv(merged, path = "outputs/merged_predictor_lake_color_data_02182021.csv")
+
+modelInput = merged
+
+save(modelInput, file = "outputs/modelInput_20210218.RData")
+
+lakeElev = read_csv("data/lake_center_elevation_038ec249d09358b3715e0f02c89e6d98.csv", col_types = "cnn")
+lakeMetric = read_csv("data/lakeMetrics_022b85da71a43d98e7c2cea22c6c0c66.csv")
+
+lakeElev = lakeElev %>% 
+  group_by(id) %>% 
+  summarise(elevation = mean(dem),
+            dist2shore = mean(distance)) %>% 
+  ungroup
+
+modelInput = modelInput %>% 
+  left_join(lakeElev, by = "id") %>% 
+  left_join(lakeMetric, by = "id")
+
+modelInput = modelInput %>% filter(!is.na(elevation))
+
+save(modelInput, file = "outputs/modelInput_20210218.RData")
+```
+
+## Merge attributes
+
+```{r}
+load("outputs/datModeGroup_assigned_c2d77db60e960bbcd721fb580fa05896.RData", verbose = T)
+load("outputs/lakeSampleHylakId.RData", verbose = T)
+
+datModeGroup %>% nrow() # 110,090 lakes
+
+## climate data
+merged = datModeGroup %>% inner_join(era5lake, by = "id")
+nrow(merged) # 110,090 lakes
+
+## physical parameters
+merged = merged %>% inner_join(lakeMeta, by = "id")
+merged = merged %>% filter(!is.na(class))
+nrow(merged) # 103,654 lakes (7,250 lakes don't have class and volumn values)
+
+## landcover data
+
+merged = merged %>% inner_join(landcover_ucla_lakes, by = "id")
+merged = merged %>% filter(!is.na(total_area))
+nrow(merged) # 78,543 lakes common between lakes having color data and lakes having landcover data
+
+## hydrolakes metadata
+merged = merged %>% 
+  inner_join(lakeSampleHylakId %>% 
+               filter(!is.na(Hylak_id)) %>% 
+               select(Hylak_id, Res_time, Elevation, Shore_dev, dp_lon, dp_lat, id), by = "id") %>% 
+  distinct()
+
+nrow(merged) #78,543 lakes
+
+write_csv(merged, path = "outputs/merged_predictor_lake_color_data.csv")
+
+modelInput = merged %>% 
+  rename(depth = depthMean) %>% 
+  rename(Lake_area = total_area)
+
+save(modelInput, file = "outputs/modelInput_20210126.RData")
 ```
 
 
-<!-- ## hydrolakes -->
+<!-- ### Add predictors -->
 
 <!-- ```{r} -->
-<!-- dat = read_csv(file = "data/lake_color_f247c809ee74fd2458b96420f42f876d.csv") %>%  -->
-<!--   select(-`.geo`) %>%  -->
-<!--   rename(img_id = `system:index`) -->
+<!-- version = "c2d77db60e960bbcd721fb580fa05896" -->
+<!-- load("outputs/glcp_2015.RData", verbose = T) -->
+<!-- load("outputs/basinLandCover_dd69dc1edce7dc8f026d0ac26d83389a.RData", verbose = T) -->
+<!-- load("outputs/datModeGroup_assigned_c2d77db60e960bbcd721fb580fa05896.RData", verbose = T) -->
+<!-- load("outputs/lakeSampleHylakId.RData", verbose = T) -->
 
-<!-- dat = dat %>%  -->
-<!--   mutate(date = as.Date(substr(img_id, start = 15, stop = 22), format = "%Y%m%d")) %>%  -->
-<!--   filter(cloudAndShadow == 0, -->
-<!--          snowAndIce == 0) %>%  -->
-<!--   select( -->
-<!--     clon, -->
-<!--     clat, -->
-<!--     img_id, -->
-<!--     Hylak_id, -->
-<!--     date, -->
-<!--     hue, -->
-<!--     saturation, -->
-<!--     value -->
-<!--   ) -->
+<!-- modelInput = lakeSampleHylakId %>%  -->
+<!--   dplyr::select(-distance) %>%  -->
+<!--   na.omit() %>%  -->
+<!--   left_join(glcp %>% mutate(Hylak_id = as.integer(as.character(Hylak_id))) %>% dplyr::select(-year, -bsn_lvl, -total_km2), by = "Hylak_id") %>% -->
+<!--   left_join(datModeGroup, by = "id") %>%  -->
+<!--   dplyr::select(-type) %>%  -->
+<!--   na.omit() %>%  -->
+<!--   mutate(HYBAS_ID = as.numeric(as.character(HYBAS_ID))) %>%  -->
+<!--   left_join(datBasin, by = "HYBAS_ID") -->
 
-<!-- dat %>%  -->
-<!--   ggplot() + -->
-<!--   geom_density(aes(hue, color = Hylak_id)) -->
+<!-- save(modelInput, file = "outputs/modelInput_assignedClass.RData") -->
 
-<!-- calc_hue_density = function(hue) { -->
+<!-- print("How many lakes not matched with hydrobasin?") -->
+<!-- modelInput %>% filter(is.na(cropland)) %>% nrow() -->
 
-<!--   d = density(hue, n = 512) -->
+<!-- modelInput = modelInput %>% na.omit %>% filter(nobs >= 40) -->
 
-<!--   hue_density = tibble(hue = d$x, density = d$y) %>%  -->
-<!--     filter(hue >= 0, hue <= 1) %>%  -->
-<!--     mutate(rgb_color = hsv(h = hue, s = 1, v = 1)) -->
+<!-- modelInput = modelInput %>%  -->
+<!--   rename(mode_dw = mode, -->
+<!--          depth = Depth_avg) -->
 
-<!--   return(hue_density) -->
-<!-- } -->
-<!-- calc_hue_color_bar = function(n = 100) { -->
-<!--   return(tibble(hue = seq(0, 1, length = n)) %>% mutate(rgb_color = hsv(h = hue, s = 1, v = 1))) -->
-<!-- } -->
+<!-- modelInput = modelInput %>%  -->
+<!--   filter(Res_time > 0) -->
 
-<!-- hue_density = calc_hue_density(dat$hue) -->
-
-
-<!-- MN_lake_color = hue_density %>%  -->
-<!--   ggplot(aes(hue, density)) +  -->
-<!--   geom_segment(aes(xend = hue, yend = 0, color = rgb_color), alpha = 0.7) +  -->
-<!--   geom_line(lwd = 1) +  -->
-<!--   scale_color_identity() + -->
-<!--   scale_x_continuous(limits = c(0, 1), expand = c(0, 0)) + -->
-<!--   labs( -->
-<!--     y = "Density" -->
-<!--   ) + -->
-<!--   theme( -->
-<!--     panel.background = element_blank(), -->
-<!--     axis.title = element_blank(), -->
-<!--     axis.text = element_blank(), -->
-<!--     axis.ticks = element_blank() -->
-<!--   ) -->
-
-<!-- MN_lake_color -->
-
-
-<!-- ## per lake density plot -->
-
-<!-- hue_density_lake = dat %>%  -->
-<!--   group_by(Hylak_id) %>%  -->
-<!--   do({ -->
-<!--     calc_hue_density(.$hue) %>%  -->
-<!--       mutate(n = nrow(.)) -->
-<!--   }) %>%  -->
-<!--   ungroup() -->
-
-<!-- yshift = hue_density_lake %>%  -->
-<!--   group_by(Hylak_id) %>%  -->
-<!--   summarize(ymax = max(density)) %>%  -->
-<!--   ungroup() %>%  -->
-<!--   arrange(ymax) %>%  -->
-<!--   select(Hylak_id) %>% -->
-<!--   mutate(yshift = 1:nrow(.)) -->
-
-<!-- hue_density_lake = hue_density_lake %>%  -->
-<!--   left_join(yshift, by = "Hylak_id") -->
-
-<!-- yscale = hue_density_lake %>% group_by(Hylak_id) %>% summarize(stats = median(density)) %>% ungroup() %>% pull(stats) %>% quantile(probs = 0.1) -->
-
-<!-- MN_lake_color_per_lake = hue_density_lake %>%  -->
-<!--   ggplot(aes(hue, density + yshift * yscale)) +  -->
-<!--   # geom_segment(data = calc_hue_color_bar(n = 512), aes(x = hue, y = 0, xend = hue, yend = hue_density_lake$density %>% max * 0.02, color = rgb_color), alpha = 1) + -->
-<!--   # geom_line(aes(group = Hylak_id), alpha = 0.1) + -->
-<!--   geom_segment(aes(xend = hue, yend = yshift * yscale, color = rgb_color, group = Hylak_id), alpha = 0.1) +  -->
-<!--   scale_color_identity() + -->
-<!--   scale_x_continuous(limits = c(0, 1), expand = c(0, 0)) + -->
-<!--   labs( -->
-<!--     y = "Density" -->
-<!--   ) + -->
-<!--   theme( -->
-<!--     panel.background = element_rect(color = "black", fill = "black"), -->
-<!--     panel.grid = element_blank(), -->
-<!--     axis.title = element_blank(), -->
-<!--     axis.text = element_blank(), -->
-<!--     axis.ticks = element_blank() -->
-<!--   ) -->
-
-<!-- MN_lake_color_per_lake -->
-
-<!-- MN_lake_color_per_lake %>%  -->
-<!--   ggsave(filename = "figures/MN_lake_color_per_lake.png", -->
-<!--          width = 8, -->
-<!--          height = 6, -->
-<!--          dpi = 100) -->
+<!-- save(modelInput, file = paste0("outputs/modelInput_10282020_", version, ".RData")) -->
 <!-- ``` -->
+
+<!-- ### Update tempearture and precipitation using ERA5 data -->
+
+<!-- ```{r} -->
+<!-- load(paste0("outputs/modelInput_10282020_", version, ".RData"), verbose = T) -->
+
+<!-- era5lake = dir("data/lakeTempPrecip", full.names = T) %>%  -->
+<!--   map(read_csv, col_types = "cnnnn") %>%  -->
+<!--   reduce(bind_rows) -->
+
+<!-- modelInput = modelInput %>%  -->
+<!--   dplyr::select(-total_precip_mm, -mean_annual_temp_k) %>%  -->
+<!--   left_join(era5lake, by = "id") -->
+
+<!-- save(modelInput, file = paste0("outputs/modelInput_10282020_", version, ".RData")) -->
+<!-- ``` -->
+
+
+
+## Model modal lake colors
+
+### quick cart model
+
+```{r}
+load("outputs/modelInput_20210126.RData", verbose = T)
+
+require(rpart)
+require(rpart.plot)
+names(modelInput)
+
+model = rpart(formula = group ~ Res_time + Elevation + depth + Shore_dev + total_precipitation_mean + total_precipitation_stdDev + mean_2m_air_temperature_stdDev + mean_2m_air_temperature_mean + lc_bare + cropland + pwater + snowIce + urban + lakeMeanOcc, data = modelInput) # + class
+
+model
+
+rpart.plot(model, nn = TRUE)
+
+imp = model$variable.importance
+imp = tibble(var = names(imp), importance = imp)
+imp %>% ggplot() + geom_bar(aes(x = var, y = importance), orientation = "h", stat = "identity")
+
+
+# library(party)
+# fit = ctree(formula = color ~ Res_time + Elevation + depthMean + Shore_dev + class + total_precip_mm + mean_annual_temp_k + pop_sum, data = modelInput)
+# plot(fit, main="Conditional Inference Tree for Lake color")
+```
+
+### rf model of lake groups nobs >= 20; no cropland
+```{r}
+require(randomForest)
+load("outputs/modelInput_20210126.RData", verbose = T)
+
+modelInputRf_colorGrp = modelInput %>% 
+  filter(cropland == 0) %>% 
+  dplyr::select(group, Res_time, Elevation, depth, Shore_dev, Lake_area, total_precipitation_mean, total_precipitation_stdDev, mean_2m_air_temperature_stdDev, mean_2m_air_temperature_mean, lc_bare, cropland, pwater, snowIce, urban, lakeMeanOcc)
+  
+set.seed(2020)
+splitIndex = runif(n = nrow(modelInputRf_colorGrp)) >= 0.2
+
+training = modelInputRf_colorGrp[splitIndex, ]
+validation = modelInputRf_colorGrp[!splitIndex, ]
+
+X = training[which(names(training) != "group")]
+Y = training$group
+
+X_test = validation[which(names(validation) != "group")]
+Y_test = validation$group
+
+colorGrp_rf_fit = randomForest(X, Y, samplesize = 2000, importance = TRUE, ntree = 300, do.trace = T, xtest = X_test, ytest = Y_test, nodesize = 3, keep.forest = T, mtry = 4)
+
+colorGrp_rf_fit
+
+save(colorGrp_rf_fit, file = "outputs/colorGrp_rf_models_01262021_nobsGt20_noCropland.RData")
+
+varImpPlot(colorGrp_rf_fit, main = "lake nobs >= 20; noCropland", type = 1)
+```
+
+### rf model of lake groups nobs >= 20; non-zero cropland
+```{r}
+require(randomForest)
+load("outputs/modelInput_20210126.RData", verbose = T)
+
+modelInputRf_colorGrp = modelInput %>% 
+  filter(cropland > 0) %>% 
+  dplyr::select(group, Res_time, Elevation, depth, Shore_dev, Lake_area, total_precipitation_mean, total_precipitation_stdDev, mean_2m_air_temperature_stdDev, mean_2m_air_temperature_mean, lc_bare, cropland, pwater, snowIce, urban, lakeMeanOcc)
+  
+set.seed(2020)
+splitIndex = runif(n = nrow(modelInputRf_colorGrp)) >= 0.2
+
+training = modelInputRf_colorGrp[splitIndex, ]
+validation = modelInputRf_colorGrp[!splitIndex, ]
+
+X = training[which(names(training) != "group")]
+Y = training$group
+
+X_test = validation[which(names(validation) != "group")]
+Y_test = validation$group
+
+colorGrp_rf_fit = randomForest(X, Y, samplesize = 2000, importance = TRUE, ntree = 300, do.trace = T, xtest = X_test, ytest = Y_test, nodesize = 3, keep.forest = T, mtry = 4)
+
+colorGrp_rf_fit
+
+save(colorGrp_rf_fit, file = "outputs/colorGrp_rf_models_01262021_nobsGt20_nonzeroCropland.RData")
+
+varImpPlot(colorGrp_rf_fit, main = "lake nobs >= 20; Cropland > 0", type = 1)
+```
+
+### rf model of lake groups nobs >= 20; non-zero cropland; small lakes
+```{r}
+require(randomForest)
+load("outputs/modelInput_20210126.RData", verbose = T)
+
+modelInputRf_colorGrp = modelInput %>% 
+  filter(cropland > 0,
+         Lake_area <= 179) %>% 
+  dplyr::select(group, Res_time, Elevation, depth, Shore_dev, Lake_area, total_precipitation_mean, total_precipitation_stdDev, mean_2m_air_temperature_stdDev, mean_2m_air_temperature_mean, lc_bare, cropland, pwater, snowIce, urban, lakeMeanOcc)
+  
+set.seed(2020)
+splitIndex = runif(n = nrow(modelInputRf_colorGrp)) >= 0.2
+
+training = modelInputRf_colorGrp[splitIndex, ]
+validation = modelInputRf_colorGrp[!splitIndex, ]
+
+X = training[which(names(training) != "group")]
+Y = training$group
+
+X_test = validation[which(names(validation) != "group")]
+Y_test = validation$group
+
+colorGrp_rf_fit = randomForest(X, Y, samplesize = 2000, importance = TRUE, ntree = 300, do.trace = T, xtest = X_test, ytest = Y_test, nodesize = 3, keep.forest = T, mtry = 4)
+
+colorGrp_rf_fit
+
+save(colorGrp_rf_fit, file = "outputs/colorGrp_rf_models_01262021_nobsGt20_nonzeroCropland_smallLakes.RData")
+
+varImpPlot(colorGrp_rf_fit, main = "lake nobs >= 20; Cropland > 0; Lake_area <= 179", type = 1)
+```
+
+### rf model of lake groups nobs >= 20; non-zero cropland; large lakes
+```{r}
+require(randomForest)
+load("outputs/modelInput_20210126.RData", verbose = T)
+
+modelInputRf_colorGrp = modelInput %>% 
+  filter(cropland > 0,
+         Lake_area > 179) %>% 
+  dplyr::select(group, Res_time, Elevation, depth, Shore_dev, Lake_area, total_precipitation_mean, total_precipitation_stdDev, mean_2m_air_temperature_stdDev, mean_2m_air_temperature_mean, lc_bare, cropland, pwater, snowIce, urban, lakeMeanOcc)
+  
+set.seed(2020)
+splitIndex = runif(n = nrow(modelInputRf_colorGrp)) >= 0.2
+
+training = modelInputRf_colorGrp[splitIndex, ]
+validation = modelInputRf_colorGrp[!splitIndex, ]
+
+X = training[which(names(training) != "group")]
+Y = training$group
+
+X_test = validation[which(names(validation) != "group")]
+Y_test = validation$group
+
+colorGrp_rf_fit = randomForest(X, Y, samplesize = 2000, importance = TRUE, ntree = 300, do.trace = T, xtest = X_test, ytest = Y_test, nodesize = 3, keep.forest = T, mtry = 4)
+
+colorGrp_rf_fit
+
+save(colorGrp_rf_fit, file = "outputs/colorGrp_rf_models_01262021_nobsGt20_nonzeroCropland_largeLakes.RData")
+
+varImpPlot(colorGrp_rf_fit, main = "lake nobs >= 20; Cropland > 0; Lake_area > 179", type = 1)
+```
+
+### rf model of lake groups nobs >= 20
+```{r}
+require(randomForest)
+load("outputs/modelInput_20210126.RData", verbose = T)
+
+modelInputRf_colorGrp = modelInput %>% 
+  dplyr::select(group, Res_time, Elevation, depth, Shore_dev, Lake_area, total_precipitation_mean, total_precipitation_stdDev, mean_2m_air_temperature_stdDev, mean_2m_air_temperature_mean, lc_bare, cropland, pwater, snowIce, urban, lakeMeanOcc)
+  
+set.seed(2020)
+splitIndex = runif(n = nrow(modelInputRf_colorGrp)) >= 0.2
+
+training = modelInputRf_colorGrp[splitIndex, ]
+validation = modelInputRf_colorGrp[!splitIndex, ]
+
+X = training[which(names(training) != "group")]
+Y = training$group
+
+X_test = validation[which(names(validation) != "group")]
+Y_test = validation$group
+
+colorGrp_rf_fit = randomForest(X, Y, samplesize = 2000, importance = TRUE, ntree = 300, do.trace = T, xtest = X_test, ytest = Y_test, nodesize = 3, keep.forest = T, mtry = 4)
+
+colorGrp_rf_fit
+
+save(colorGrp_rf_fit, file = "outputs/colorGrp_rf_models_01262021_nobsGt20.RData")
+
+varImpPlot(colorGrp_rf_fit, main = "lake nobs >= 20", type = 1)
+```
+
+### rf model of lake groups nobs >=40
+```{r}
+require(randomForest)
+load("outputs/modelInput_20210126.RData", verbose = T)
+
+modelInputRf_colorGrp = modelInput %>% 
+  filter(nobs >= 40) %>% 
+  dplyr::select(group, Res_time, Elevation, depth, Shore_dev, Lake_area, total_precipitation_mean, total_precipitation_stdDev, mean_2m_air_temperature_stdDev, mean_2m_air_temperature_mean, lc_bare, cropland, pwater, snowIce, urban, lakeMeanOcc) 
+  
+set.seed(2020)
+splitIndex = runif(n = nrow(modelInputRf_colorGrp)) >= 0.2
+
+training = modelInputRf_colorGrp[splitIndex, ]
+validation = modelInputRf_colorGrp[!splitIndex, ]
+
+X = training[which(names(training) != "group")]
+Y = training$group
+
+X_test = validation[which(names(validation) != "group")]
+Y_test = validation$group
+
+colorGrp_rf_fit = randomForest(X, Y, samplesize = 2000, importance = TRUE, ntree = 300, do.trace = T, xtest = X_test, ytest = Y_test, nodesize = 3, keep.forest = T, mtry = 4)
+
+colorGrp_rf_fit
+
+save(colorGrp_rf_fit, file = "outputs/colorGrp_rf_models_01262021_nobsGt40.RData")
+
+varImpPlot(colorGrp_rf_fit, main = "lake nobs >= 40", type = 1)
+```
+
+### rf model of lake groups nobs >=40; lvl12
+```{r}
+require(randomForest)
+load("outputs/modelInput_20210126.RData", verbose = T)
+
+modelInputRf_colorGrp = modelInput %>% 
+  filter(nobs >= 40,
+         nchar(PFAF_ID) == 12) %>% 
+  dplyr::select(group, Res_time, Elevation, depth, Shore_dev, Lake_area, total_precipitation_mean, total_precipitation_stdDev, mean_2m_air_temperature_stdDev, mean_2m_air_temperature_mean, lc_bare, cropland, pwater, snowIce, urban, lakeMeanOcc) 
+  
+set.seed(2020)
+splitIndex = runif(n = nrow(modelInputRf_colorGrp)) >= 0.2
+
+training = modelInputRf_colorGrp[splitIndex, ]
+validation = modelInputRf_colorGrp[!splitIndex, ]
+
+X = training[which(names(training) != "group")]
+Y = training$group
+
+X_test = validation[which(names(validation) != "group")]
+Y_test = validation$group
+
+colorGrp_rf_fit = randomForest(X, Y, samplesize = 2000, importance = TRUE, ntree = 300, do.trace = T, xtest = X_test, ytest = Y_test, nodesize = 3, keep.forest = T, mtry = 4)
+
+colorGrp_rf_fit
+
+save(colorGrp_rf_fit, file = "outputs/colorGrp_rf_models_01262021_nobsGt40_pfaflvl12.RData")
+
+varImpPlot(colorGrp_rf_fit, main = "lake nobs >= 40; lvl12")
+```
+
+### Factors influence grouping
+
+```{r}
+# https://stackoverflow.com/questions/8545035/scatterplot-with-marginal-histograms-in-ggplot2
+
+fillCol = scale_fill_manual(values = c("blue", "cyan", "orange", "yellow"))
+
+modelInputRf_colorGrp %>% 
+  mutate(tempGrp = cut(mean_2m_air_temperature_mean, breaks = quantile(mean_2m_air_temperature_mean, probs = seq(0, 1, by = 0.1)), include.lowest = T)) %>% 
+  ggplot() +
+  geom_bar(aes(x = tempGrp, fill = group), position = "fill") +
+  theme(axis.text.x.bottom = element_text(angle = 45, hjust = 1, vjust = 0.5)) +
+  fillCol
+
+modelInputRf_colorGrp %>% 
+  mutate(elevGrp = cut(Elevation, breaks = quantile(Elevation, probs = seq(0, 1, by = 0.1)), include.lowest = T)) %>% 
+  ggplot() +
+  geom_bar(aes(x = elevGrp, fill = group), position = "fill") +
+  theme(axis.text.x.bottom = element_text(angle = 45, hjust = 1, vjust = 0.5)) +
+  fillCol
+
+modelInputRf_colorGrp %>% 
+  mutate(depthGrp = cut(depth, breaks = quantile(depth, probs = seq(0, 1, by = 0.05)), include.lowest = T)) %>% 
+  ggplot() +
+  geom_bar(aes(x = depthGrp, fill = group), position = "fill") +
+  theme(axis.text.x.bottom = element_text(angle = 45, hjust = 1, vjust = 0.5)) +
+  fillCol
+
+modelInputRf_colorGrp %>% 
+  mutate(croplandGrp = cut(cropland, breaks = unique(quantile(cropland, probs = seq(0, 1, by = 0.1))), include.lowest = T)) %>% 
+  ggplot() +
+  geom_bar(aes(x = croplandGrp, fill = group), position = "fill") +
+  theme(axis.text.x.bottom = element_text(angle = 45, hjust = 1, vjust = 0.5)) +
+  fillCol
+
+modelInputRf_colorGrp %>% 
+  mutate(lakeMeanOccGrp = cut(lakeMeanOcc, breaks = quantile(lakeMeanOcc, probs = seq(0, 1, by = 0.1)), include.lowest = T)) %>% 
+  ggplot() +
+  geom_bar(aes(x = lakeMeanOccGrp, fill = group), position = "fill") +
+  theme(axis.text.x.bottom = element_text(angle = 45, hjust = 1, vjust = 0.5)) +
+  fillCol
+
+modelInputRf_colorGrp %>% 
+  mutate(lakeMeanOccGrp = cut(lakeMeanOcc, breaks = quantile(lakeMeanOcc, probs = seq(0, 1, by = 0.1)), include.lowest = T)) %>% 
+  ggplot() +
+  geom_bar(aes(x = lakeMeanOccGrp, fill = group), position = "fill") +
+  theme(axis.text.x.bottom = element_text(angle = 45, hjust = 1, vjust = 0.5)) +
+  fillCol
+  
+```
+
+### Permutation feature importance
+
+```{r}
+require(iml)
+load("outputs/colorGrp_rf_models_10282020.RData", verbose = T)
+rf_fit = colorGrp_rf_fit
+
+pred <- function(model, newdata)  {
+  results <- as.data.frame(predict(model, newdata))
+  return(results)
+}
+
+print(pred(rf_fit, X_test) %>% head)
+
+predictor = Predictor$new(model = rf_fit, data = X, y = Y, predict.fun = pred,
+  class = "classification")
+
+imp = FeatureImp$new(predictor, loss = "ce", compare = "ratio", n.repetitions = 100)
+plot(imp)
+plot(imp) %>% ggsave(filename = "figs/lakeGroup_rf_importance_training_set_n100.png", width = 7, height = 4)
+
+depth_effs <- FeatureEffect$new(predictor, feature = "depth", method = "ale", grid.size = 50)
+elevation_effs <- FeatureEffect$new(predictor, feature = "Elevation", method = "ale", grid.size = 50)
+temp_effs <- FeatureEffect$new(predictor, feature = "mean_annual_temp_k", method = "ale", grid.size = 50)
+cropland_effs <- FeatureEffect$new(predictor, feature = "cropland", method = "ale", grid.size = 50)
+shoreDev_effs <- FeatureEffect$new(predictor, feature = "Shore_dev", method = "ale", grid.size = 50)
+pop_effs <- FeatureEffect$new(predictor, feature = "pop_sum", method = "ale", grid.size = 50)
+area_effs <- FeatureEffect$new(predictor, feature = "Lake_area", method = "ale", grid.size = 50)
+pwater_effs <- FeatureEffect$new(predictor, feature = "pwater", method = "ale", grid.size = 50)
+Res_time_effs <- FeatureEffect$new(predictor, feature = "Res_time", method = "ale", grid.size = 25)
+
+
+p1 = depth_effs$plot() + geom_point()
+p2 = elevation_effs$plot() + geom_point()
+p3 = temp_effs$plot() + geom_point()
+p4 = shoreDev_effs$plot() + geom_point()
+p5 = cropland_effs$plot() + geom_point()
+p6 = pwater_effs$plot() + geom_point()
+p7 = area_effs$plot() + geom_point()
+```
+
+### Violin plot for a few important factors
+
+```{r}
+load(paste0("outputs/modelInput_10282020_", version, ".RData"), verbose = T)
+depths = read_csv(file = "outputs/lake_sample_depths.csv", col_types = "cn")
+
+modelInput %>% 
+  dplyr::select(group, depth, mean_2m_air_temperature_mean, cropland) %>% 
+  gather(key = "name", value = "value", -group) %>% 
+  ggplot() +
+  geom_violin(aes(x = group, y = value), trim = T) +
+  facet_wrap(~name, nrow = 1, scale = "free_y")
+
+modelInput = modelInput %>% 
+  mutate(group = factor(group, levels = c("blue:stable", "blue:variable", "yellow:stable", "yellow:variable"), labels = c("Blue:Stable", "Blue:Variable", "Yellow:Stable", "Yellow:Variable"))) %>% 
+  left_join(depths, by = "id")
+
+p1 = modelInput %>% 
+  filter(cropland > 0.0) %>% 
+  ggplot() + 
+  geom_violin(aes(x = cropland, y = group), fill = "darkgrey", trim = T, scale = "width") +
+  geom_boxplot(aes(x = cropland, y = group, fill = group), width = 0.1, outlier.colour = "black", outlier.alpha = 0.5, outlier.size = 0.6) + 
+  scale_x_continuous(label = scales::percent_format(), position = "top") +
+    scale_fill_manual(values = c("cyan", "lightblue", "orange", "yellow"), guide = guide_legend(title.position = "top")) +
+  labs(x = "Cropland %", y = "Lake color group", fill = "Lake color group") + 
+  theme(axis.title.y = element_blank(), axis.text.y = element_blank(), axis.ticks.y = element_blank(),
+        legend.position = "bottom", panel.background = element_blank(), panel.grid.major.x = element_line(color = "grey90"),
+        panel.grid.major.y = element_blank(), panel.grid.minor.x = element_blank())
+
+p1 %>% ggsave(filename = "figs/cropland.png", width = 7, height = 5)
+
+p2 = modelInput %>% 
+  mutate(depth = depthMean) %>% 
+  # filter(cropland > 0.0) %>% 
+  ggplot() + 
+  geom_violin(aes(x = depth, y = group), fill = "darkgrey", trim = T, scale = "width") +
+  geom_boxplot(aes(x = depth, y = group, fill = group), width = 0.1, outlier.colour = "black", outlier.alpha = 0.5, outlier.size = 0.6) + 
+  scale_x_log10(position = "top") +
+    scale_fill_manual(values = c("cyan", "lightblue", "orange", "yellow"), guide = guide_legend(title.position = "top")) +
+  labs(x = "Average depth (meter)", y = "Lake color group", fill = "Lake color group", position = "top") + 
+  theme(axis.title.y = element_blank(), axis.text.y = element_blank(), axis.ticks.y = element_blank(),
+        legend.position = "bottom", panel.background = element_blank(), panel.grid.major.x = element_line(color = "grey90"),
+        panel.grid.major.y = element_blank(), panel.grid.minor.x = element_blank())
+
+p2
+
+p2 %>% ggsave(filename = "figs/depth.png", width = 7, height = 5)
+
+p3 = modelInput %>% 
+  # filter(cropland > 0.0) %>% 
+  ggplot() + 
+  geom_violin(aes(x = mean_2m_air_temperature_mean, y = group), fill = "darkgrey", trim = T, scale = "width") +
+  geom_boxplot(aes(x = mean_2m_air_temperature_mean, y = group, fill = group), width = 0.1, outlier.colour = "black", outlier.alpha = 0.5, outlier.size = 0.6) + 
+  scale_x_continuous(position = "top") +
+  scale_fill_manual(values = c("cyan", "lightblue", "orange", "yellow"), guide = guide_legend(title.position = "top")) +
+  labs(x = "Mean surface air temperature (Kelvin)", y = "Lake color group", fill = "Lake color group") + 
+  theme(axis.title.y = element_blank(), axis.text.y = element_blank(), axis.ticks.y = element_blank(),
+        legend.position = "bottom", panel.background = element_blank(), panel.grid.major.x = element_line(color = "grey90"),
+        panel.grid.major.y = element_blank(), panel.grid.minor.x = element_blank())
+  
+p3 %>% ggsave(filename = "figs/temp.png", width = 7, height = 5)
+
+
+
+
+### merged figure
+p1 = modelInput %>% 
+  filter(cropland > 0.0) %>% 
+  ggplot() + 
+  geom_violin(aes(x = cropland, y = group), fill = "darkgrey", trim = T, scale = "width") +
+  geom_boxplot(aes(x = cropland, y = group, fill = group), width = 0.1, outlier.colour = "black", outlier.alpha = 0.5, outlier.size = 0.6, show.legend = F) + 
+  scale_x_continuous(label = scales::percent_format(), position = "top") +
+  scale_fill_manual(values = c("cyan", "lightblue", "orange", "yellow"), guide = guide_legend(title.position = "top")) +
+  labs(x = "Cropland %", y = "Lake color group", fill = "Lake color group") + 
+  theme(axis.title.y = element_blank(), axis.text.y = element_blank(), axis.ticks.y = element_blank(),
+        legend.position = "bottom", panel.background = element_blank(), panel.grid.major.x = element_line(color = "grey90"),
+        panel.grid.major.y = element_blank(), panel.grid.minor.x = element_blank())
+
+p1 %>% ggsave(filename = "figs/cropland_small.png", width = 4.5, height = 3)
+
+p2 = modelInput %>% 
+  mutate(depth = depthMean) %>% 
+  # filter(cropland > 0.0) %>% 
+  ggplot() + 
+  geom_violin(aes(x = depth, y = group), fill = "darkgrey", trim = T, scale = "width") +
+  geom_boxplot(aes(x = depth, y = group, fill = group), width = 0.1, outlier.colour = "black", outlier.alpha = 0.5, outlier.size = 0.6, show.legend = F) + 
+  scale_x_log10(position = "top") +
+    scale_fill_manual(values = c("cyan", "lightblue", "orange", "yellow"), guide = guide_legend(title.position = "top")) +
+  labs(x = "Average depth (meter)", y = "Lake color group", fill = "Lake color group", position = "top") + 
+  theme(axis.title.y = element_blank(), axis.text.y = element_blank(), axis.ticks.y = element_blank(),
+        legend.position = "bottom", panel.background = element_blank(), panel.grid.major.x = element_line(color = "grey90"),
+        panel.grid.major.y = element_blank(), panel.grid.minor.x = element_blank())
+
+p2
+
+p2 %>% ggsave(filename = "figs/depth_small.png", width = 4.5, height = 3)
+
+p3 = modelInput %>% 
+  # filter(cropland > 0.0) %>% 
+  ggplot() + 
+  geom_violin(aes(x = mean_2m_air_temperature_mean, y = group), fill = "darkgrey", trim = T, scale = "width") +
+  geom_boxplot(aes(x = mean_2m_air_temperature_mean, y = group, fill = group), width = 0.1, outlier.colour = "black", outlier.alpha = 0.5, outlier.size = 0.6, show.legend = F) + 
+  scale_x_continuous(position = "top") +
+  scale_fill_manual(values = c("cyan", "lightblue", "orange", "yellow"), guide = guide_legend(title.position = "top")) +
+  labs(x = "Mean surface air temperature (Kelvin)", y = "Lake color group", fill = "Lake color group") + 
+  theme(axis.title.y = element_blank(), axis.text.y = element_blank(), axis.ticks.y = element_blank(),
+        legend.position = "bottom", panel.background = element_blank(), panel.grid.major.x = element_line(color = "grey90"),
+        panel.grid.major.y = element_blank(), panel.grid.minor.x = element_blank())
+  
+p3 %>% ggsave(filename = "figs/temp_small.png", width = 4.5, height = 3)
+```
+
+
+### rf model of lake color variation
+
+```{r}
+require(randomForest)
+load(paste0("outputs/modelInput_10282020_", version, ".RData"), verbose = T)
+
+modelInputRf_colorGrp = modelInput %>% 
+  filter(str_detect(as.character(group), "Unimodal")) %>% 
+  # filter(lakeMeanOcc >= 0.9) %>% 
+  mutate(group = as.factor(as.character(group))) %>% 
+  dplyr::select(dwStd, mode_dw, Res_time, Elevation, depth, Shore_dev, Lake_area, total_precipitation_mean, total_precipitation_stdDev, mean_2m_air_temperature_stdDev, mean_2m_air_temperature_mean, pop_sum, lc_bare, cropland, pwater, snowIce, urban, lakeMeanOcc)
+  
+set.seed(2020)
+splitIndex = runif(n = nrow(modelInputRf_colorGrp)) >= 0.2
+
+training = modelInputRf_colorGrp[splitIndex, ]
+validation = modelInputRf_colorGrp[!splitIndex, ]
+
+X = training[which(names(training) != "dwStd")]
+Y = training$dwStd
+
+X_test = validation[which(names(validation) != "dwStd")]
+Y_test = validation$dwStd
+
+colorStd_rf_fit = randomForest(X, Y, samplesize = 2000, importance = TRUE, ntree = 300, do.trace = T, xtest = X_test, ytest = Y_test, nodesize = 1, keep.forest = T, mtry = 4)
+
+colorStd_rf_fit
+
+save(colorStd_rf_fit, file = "outputs/colorStd_rf_models_11132020.RData")
+
+varImpPlot(colorStd_rf_fit)
+
+Y_pred = colorStd_rf_fit$test$predicted
+
+tibble(Y_test, Y_pred) %>% 
+  ggplot() +
+  geom_abline(aes(slope = 1, intercept = 0)) +
+  geom_point(aes(x = Y_test, y = Y_pred), size = 1, alpha = 0.7) +
+  coord_equal()
+  
+```
+
+## Lake groups
+
+```{r}
+library(mapview)
+library(raster)
+
+pal = mapviewPalette("mapviewTopoColors")
+lakeGroup <- stack("outputs/lakeGroupMap_e7dfd16f89c5169e91cbac9d186edc83.tif")
+
+mapview(lakeGroup[[1]], col.regions = c("blue", "orange", "cyan", "yellow"), at = c(0.5, 2, 4, 6, 8), legend = TRUE, maxpixels =  16499200)
+```
+
+
+
+### rf model of mode dw
+
+```{r}
+require(randomForest)
+
+modelInputRf = modelInput %>% 
+  select(mode_dw, Res_time, Elevation, depth, Shore_dev, Lake_area, total_precip_mm, mean_annual_temp_k, pop_sum, lc_bare, cropland, pwater, snowIce, urban) %>% 
+  filter(Res_time != -9999) %>% 
+  na.omit
+
+require(corrplot)
+corrplot(cor(modelInputRf))
+
+set.seed(2020)
+splitIndex = runif(n = nrow(modelInputRf)) >= 0.2
+
+training = modelInputRf[splitIndex, ]
+validation = modelInputRf[!splitIndex, ]
+
+X = training[which(names(training) != "mode_dw")]
+Y = training$mode_dw
+
+X_test = validation[which(names(validation) != "mode_dw")]
+Y_test = validation$mode_dw
+
+dw_rf_fit = randomForest(X, Y, samplesize = 500, importance = TRUE, ntree = 100, do.trace = T, xtest = X_test, ytest = Y_test, nodesize = 30, keep.forest = T)
+
+save(dw_rf_fit, file = "outputs/dw_rf_models_09232020.RData")
+
+dw_rf_fit
+varImpPlot(dw_rf_fit)
+
+testData = validation %>% 
+  select(mode_dw) %>% 
+  bind_cols(tibble(pred = dw_rf_fit$test$predicted))
+
+test_comp = testData %>% ggplot() +
+  geom_hex(aes(x = mode_dw, y = pred, fill = ..count..)) + 
+  geom_abline(aes(slope = 1, intercept = 0, color = "1:1")) +
+  # scale_y_continuous(limits = c(475, 575)) +
+  # scale_x_continuous(limits = c(475, 600)) +
+  scale_fill_viridis_c() + labs(x = "Modal color observed (nm)", y = "Modal color predicted (nm)", color = "", fill = "Count")
+
+test_comp
+
+test_comp %>% ggsave(filename = "figs/dw_rf_test_comp.png", width = 6, height = 6)
+
+testStats = testData %>% 
+  mutate(dif = pred - mode_dw) %>% 
+  summarise(
+    mae = mean(abs(dif)),
+    rmse = sqrt(mean(dif^2)),
+    mbs = mean(dif)
+  )
+
+testStats
+```
+
+### grouping data for plot with importance factors
+
+```{r}
+important_factors = modelInputRf %>% 
+  mutate(mdwGrp = cut(mode_dw, breaks = quantile(mode_dw, probs = seq(0, 1, by = 0.1)), include.lowest = T)) %>% 
+  gather(key = "variable", value = "value", c(Elevation, depth, Shore_dev, mean_annual_temp_k, pop_sum, cropland)) %>% 
+  mutate(variable = factor(variable, levels = c('depth', 'mean_annual_temp_k', "Elevation", "cropland", 'Shore_dev', "pop_sum"),
+                           labels = c("Depth (m)", "Mean annual temperature (K)", "Elevation (m)", "Cropland (0-1)", "Shoreline complexity", "Total population"))) %>% 
+  ggplot() +
+  geom_violin(aes(x = mdwGrp, y = value), draw_quantiles = 0.5) +
+  scale_y_log10() +
+  facet_wrap(~variable, scales = "free_y") +
+  labs(x = "MDW (nm)", y = "") +
+  theme(axis.text.x.bottom = element_text(angle = -90, vjust = 0.5))
+
+important_factors %>% 
+  ggsave(filename = "figs/important_factors.png",
+         width = 7,
+         height = 5)
+```
+
+__Supplemental information__
+
+## Initial data inspection
+### Compare generic and Landsat 8 specific dominant wavelength algorithms
+### Animation to compare generic dw (dw) and Landsat 8 specific dw algorithm (dwLehmann)
+
+```{r}
+load("outputs/lake_color_per_img_c2d77db60e960bbcd721fb580fa05896.RData", verbose = T)
+
+datFil = datFil %>% 
+  mutate(rgbcolor = rgb(Red, Green, Blue),
+         hue = rgb2hsv(r = Red, g = Green, b = Blue, maxColorValue = 1)[1, ],
+         huecolor = hsv(h = hue, s = 1, v = 0.7)) %>% 
+  na.omit()
+
+set.seed(2020)
+subSampleDwLehmann = datFil %>% 
+  mutate(dwInt = round(dwLehmannPost, digits = 0)) %>% 
+  filter(dwInt >= 475, dwInt <= 600) %>%
+  group_by(dwInt) %>% 
+  sample_n(size = 20) %>% 
+  mutate(index = 1:20) %>% 
+  ungroup() %>% 
+  mutate(`dw algorithm` = "Landsat 8 specific")
+
+set.seed(2020)
+subSampleDwGeneric = datFil %>% 
+  mutate(dwInt = round(dwPost, digits = 0)) %>% 
+  filter(dwInt >= 475, dwInt <= 600) %>%
+  group_by(dwInt) %>% 
+  sample_n(size = 20) %>% 
+  mutate(index = 1:20) %>% 
+  ungroup() %>% 
+  mutate(`dw algorithm` = "Generic")
+
+subSampleDw = bind_rows(subSampleDwLehmann, subSampleDwGeneric) %>% 
+  mutate(rgbcolor = rgb(Red, Green, Blue),
+         hue = rgb2hsv(r = Red, g = Green, b = Blue, maxColorValue = 1)[1, ],
+         saturation = rgb2hsv(r = Red, g = Green, b = Blue, maxColorValue = 1)[2, ],
+         huecolor = hsv(h = hue, s = saturation, v = 0.7))
+
+subSampleDw %>% 
+  ggplot +
+  geom_point(aes(x = index, y = dwInt, color = huecolor)) +
+  scale_color_identity() +
+  facet_wrap(~`dw algorithm`)
+
+
+## animation of color
+require(gganimate)
+anim = subSampleDw %>% 
+  filter(`dw algorithm` == "Landsat 8 specific") %>% 
+  ggplot() +
+  geom_point(aes(1, 1, color = huecolor), size= 50, pch = 15) +
+  scale_color_identity() +
+  scale_x_continuous(expand = c(0, 0)) +
+  scale_y_continuous(expand = c(0, 0)) +
+  labs(title = 'Dominant wavelength (nm): {round(frame_time)}') +
+  facet_wrap(~index, nrow = 5) + 
+  theme(
+    axis.title = element_blank(),
+    axis.ticks = element_blank(),
+    axis.text = element_blank()
+  ) +
+  transition_time(time = dwInt)
+
+animate(anim, end_pause = 10, fps = 4, nframes = 114)
+```
+
+### Compare dwGeneric and dwLehmann
+
+```{r}
+
+compDws = datFil %>% 
+  sample_n(10000) %>% 
+  ggplot() +
+  geom_point(aes(x = dw, y = dwLehmann), alpha = 0.1, size = 0.3) +
+  geom_abline(aes(slope = 1, intercept = 0), color = "red") +
+  labs(x = "DW generic", y = "DW Landsat 8") +
+  coord_equal()
+
+compDws
+
+compDws %>% ggsave(filename = "figs/compDws_c2d77db60e960bbcd721fb580fa05896.png", width = 6, height = 5)
+
+compDwDensity = datFil %>% 
+  select(dw, dwLehmann) %>% 
+  gather() %>% 
+  ggplot() + 
+  geom_density(aes(value, fill = key), alpha = 0.3)
+
+compDwDensity
+
+compDwDensity %>% ggsave(filename = "figs/compDwDensity_c2d77db60e960bbcd721fb580fa05896.png", width = 6, height = 4)
+```
+
+### Compare averaged dw (from GEE) to dw from averaged bands (postprocessing)
+
+dw for each pixel was calculated on GEE and averaged using mean reducer before downloading; dw is also reconstructed from averaged uBlue, Blue, Green, and Red bands data in R using the same algorithm as in GEE. Due to the nonlinearity of the dw calculation, these two metrics (mean dw v.s. dw from mean reflectances) should not match exactly. Here to show that the discrepancy is small.
+
+```{r}
+load("outputs/lake_color_per_img_c2d77db60e960bbcd721fb580fa05896.RData", verbose = T)
+
+mean_dw_vs_dw_from_mean = datFil %>% 
+  sample_n(size = 20000) %>% 
+  ggplot() +
+  geom_point(aes(x = dwLehmann, y = dwLehmannPost), size = 0.3, alpha = 0.2) +
+  geom_smooth(aes(x = dwLehmann, y = dwLehmannPost, color = "linear fit"), method = "lm") +
+  geom_abline(aes(slope = 1, intercept = 0, color = "1:1 line")) +
+  labs(x = "Mean DW (nm)", y = "DW from mean Rs (nm)")
+
+mean_dw_vs_dw_from_mean
+
+mean_dw_vs_dw_from_mean %>% ggsave(filename = "figs/mean_dw_vs_dw_from_mean_c2d77db60e960bbcd721fb580fa05896.png",
+                                   width = 6,
+                                   height = 6)
+```
+
+### Relationship between brightness and dw
+
+```{r}
+dw_vs_brightness = datFil %>% 
+  sample_n(size = 10000) %>% 
+  ggplot() +
+  geom_point(aes(x = dwLehmann, y = brightness), size = 0.3, alpha = 0.2) +
+  labs(x = "DW (nm)", y = "Brightness")
+
+dw_vs_brightness
+
+dw_vs_brightness %>% 
+  ggsave(filename = "figs/dw_vs_brightness.png",
+         height = 6,
+         width = 6)
+
+brightnessVSdw = datFil %>% 
+  mutate(brightnessGrp = cut(brightness, breaks = quantile(brightness, probs = seq(0, 1, length = 11)), include.lowest = T)) %>% 
+  ggplot +
+  geom_violin(aes(x = brightnessGrp, y = dwLehmann), fill = "green") +
+  labs(x = "Brightness Groups", y = "DW (nm)") +
+  theme(
+    axis.text.x.bottom = element_text(angle = 45, hjust = 1)
+  )
+
+brightnessVSdw
+  
+brightnessVSdw %>% ggsave(filename = "figs/brightnessVSdw_c2d77db60e960bbcd721fb580fa05896.png", width = 7, height = 5)
+```
+
+### Relationship between temperature and dw
+
+```{r}
+dw_vs_temperature = datFil %>% 
+  sample_n(size = 20000) %>% 
+  ggplot() +
+  geom_point(aes(x = dwLehmann, y = mean_2m_air_temperature), size = 0.3, alpha = 0.2) +
+  labs(x = "DW (nm)", y = "Temperature")
+
+dw_vs_temperature
+
+dw_vs_temperature %>% 
+  ggsave(filename = "figs/dw_vs_temperature_c2d77db60e960bbcd721fb580fa05896.png",
+         height = 6,
+         width = 6)
+
+
+temperatureVSdw = datFil %>% 
+  mutate(temperatureGrp = cut(mean_2m_air_temperature, breaks = quantile(mean_2m_air_temperature, probs = seq(0, 1, length = 11)), include.lowest = T)) %>% 
+  ggplot +
+  geom_violin(aes(x = temperatureGrp, y = dwLehmann), fill = "green") +
+  labs(x = "Temperature Groups", y = "DW (nm)") +
+  theme(
+    axis.text.x.bottom = element_text(angle = 45, hjust = 1)
+  )
+
+temperatureVSdw
+  
+temperatureVSdw %>% ggsave(filename = "figs/temperatureVSdw_c2d77db60e960bbcd721fb580fa05896.png", width = 7, height = 5)
+```
+
+## Monthly color
+
+### Monthly color
+
+```{r}
+require(lubridate)
+dat %>% 
+  right_join(
+    dat %>% select(id) %>% distinct() %>% 
+      sample_frac(0.05), by = "id"
+  ) %>% 
+  mutate(m = month(date)) %>% 
+  ggplot() +
+  geom_density(aes(x = dwLehmann)) +
+  facet_wrap(~m)
+
+monthlyColor = datFil %>% 
+  mutate(m = month(date)) %>% 
+  select(id, m, dwLehmann) %>% 
+  group_by(id, m) %>% 
+  summarise(dwMean = mean(dwLehmann),
+            dwMedian = median(dwLehmann),
+            n = n(),
+            dwStd = sd(dwLehmann)) %>% 
+  ungroup()
+
+summary(monthlyColor)
+
+monthlyColor = monthlyColor %>% replace_na(list(dwMean = -999, dwMedian = -999, dwStd = -999))
+
+write_csv(monthlyColor, path = "outputs/monthlyColor_c2d77db60e960bbcd721fb580fa05896.csv")
+```
+
+
+### Monthly global map (rasterize in r)
+
+```{r}
+require(raster)
+require(rnaturalearthdata)
+
+colorGen = function() {
+    return(c('#610061', '#640066', '#67006A', '#6A006F', '#6D0073', '#6F0077', '#72007C', '#740080', '#760084', '#780088', '#79008D', '#7B0091', '#7C0095', '#7E0099', '#7F009D', '#8000A1', '#8100A5', '#8100A9', '#8200AD', '#8200B1', '#8300B5', '#8300B9', '#8300BC', '#8300C0', '#8200C4', '#8200C8', '#8100CC', '#8100CF', '#8000D3', '#7F00D7', '#7E00DB', '#7C00DE', '#7B00E2', '#7900E6', '#7800E9', '#7600ED', '#7400F1', '#7100F4', '#6F00F8', '#6D00FB', '#6A00FF', '#6600FF', '#6100FF', '#5D00FF', '#5900FF', '#5400FF', '#5000FF', '#4B00FF', '#4600FF', '#4200FF', '#3D00FF', '#3800FF', '#3300FF', '#2E00FF', '#2800FF', '#2300FF', '#1D00FF', '#1700FF', '#1100FF', '#0A00FF', '#0000FF', '#000BFF', '#0013FF', '#001BFF', '#0022FF', '#0028FF', '#002FFF', '#0035FF', '#003BFF', '#0041FF', '#0046FF', '#004CFF', '#0051FF', '#0057FF', '#005CFF', '#0061FF', '#0066FF', '#006CFF', '#0071FF', '#0076FF', '#007BFF', '#007FFF', '#0084FF', '#0089FF', '#008EFF', '#0092FF', '#0097FF', '#009CFF', '#00A0FF', '#00A5FF', '#00A9FF', '#00AEFF', '#00B2FF', '#00B7FF', '#00BBFF', '#00C0FF', '#00C4FF', '#00C8FF', '#00CDFF', '#00D1FF', '#00D5FF', '#00DAFF', '#00DEFF', '#00E2FF', '#00E6FF', '#00EAFF', '#00EFFF', '#00F3FF', '#00F7FF', '#00FBFF', '#00FFFF', '#00FFF5', '#00FFEA', '#00FFE0', '#00FFD5', '#00FFCB', '#00FFC0', '#00FFB5', '#00FFA9', '#00FF9E', '#00FF92', '#00FF87', '#00FF7B', '#00FF6E', '#00FF61', '#00FF54', '#00FF46', '#00FF38', '#00FF28', '#00FF17', '#00FF00', '#09FF00', '#0FFF00', '#15FF00', '#1AFF00', '#1FFF00', '#24FF00', '#28FF00', '#2DFF00', '#31FF00', '#36FF00', '#3AFF00', '#3EFF00', '#42FF00', '#46FF00', '#4AFF00', '#4EFF00', '#52FF00', '#56FF00', '#5AFF00', '#5EFF00', '#61FF00', '#65FF00', '#69FF00', '#6CFF00', '#70FF00', '#73FF00', '#77FF00', '#7BFF00', '#7EFF00', '#81FF00', '#85FF00', '#88FF00', '#8CFF00', '#8FFF00', '#92FF00', '#96FF00', '#99FF00', '#9CFF00', '#A0FF00', '#A3FF00', '#A6FF00', '#A9FF00', '#ADFF00', '#B0FF00', '#B3FF00', '#B6FF00', '#B9FF00', '#BDFF00', '#C0FF00', '#C3FF00', '#C6FF00', '#C9FF00', '#CCFF00', '#CFFF00', '#D2FF00', '#D5FF00', '#D8FF00', '#DBFF00', '#DEFF00', '#E1FF00', '#E4FF00', '#E7FF00', '#EAFF00', '#EDFF00', '#F0FF00', '#F3FF00', '#F6FF00', '#F9FF00', '#FCFF00', '#FFFF00', '#FFFC00', '#FFF900', '#FFF600', '#FFF200', '#FFEF00', '#FFEC00', '#FFE900', '#FFE600', '#FFE200', '#FFDF00', '#FFDC00', '#FFD900', '#FFD500', '#FFD200', '#FFCF00', '#FFCB00', '#FFC800', '#FFC500', '#FFC100', '#FFBE00', '#FFBB00', '#FFB700', '#FFB400', '#FFB000', '#FFAD00', '#FFA900', '#FFA600', '#FFA200', '#FF9F00', '#FF9B00', '#FF9800', '#FF9400', '#FF9100', '#FF8D00', '#FF8900', '#FF8600', '#FF8200', '#FF7E00', '#FF7B00', '#FF7700', '#FF7300', '#FF6F00', '#FF6B00', '#FF6700', '#FF6300', '#FF5F00', '#FF5B00', '#FF5700', '#FF5300', '#FF4F00', '#FF4B00', '#FF4600', '#FF4200', '#FF3E00', '#FF3900', '#FF3400', '#FF3000', '#FF2B00', '#FF2600', '#FF2100', '#FF1B00', '#FF1600', '#FF1000', '#FF0900', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000'))}
+colors = colorGen()
+dt_projection = "+proj=robin +lon_0=0 +datum=WGS84 +units=m +no_defs" 
+
+cl = rnaturalearthdata::countries50 %>% 
+  st_as_sf() %>% 
+  filter(continent != "Antarctica") %>% 
+  st_transform(dt_projection) %>% 
+  st_union()
+
+bounds = st_bbox(cl)
+
+monthlyColor = read_csv("outputs/monthlyColor_c2d77db60e960bbcd721fb580fa05896.csv", col_types = "cinnin")
+lakeData = st_read(dsn = "outputs/lake_samples_jida_05172020.shp")
+lakeData = lakeData %>% st_transform(crs = dt_projection)
+lakeData = lakeData %>% mutate(size = st_area(geometry))
+
+for (month in 2:12) {
+  
+  lakeDataThisMonth = lakeData %>% 
+    left_join(monthlyColor %>% filter(m == month, n >= 3), by = "id") %>% 
+    na.omit() %>% 
+    arrange(desc(size)) %>% 
+    dplyr::select(dwMedian)
+  
+  colorRaster = stars::st_rasterize(sf = lakeDataThisMonth, nx = 3000, ny = 2000, options = c("ALL_TOUCHED=TRUE", "MERGE_ALG=REPLACE"))
+  
+  monthlyColorMap = ggplot() +
+    geom_sf(data = cl, color = NA, fill = "black") +
+    geom_stars(data = colorRaster) +
+    scale_fill_gradientn(limits = c(450, 600), colours = colors[71:221], na.value='#FFFFFF00',
+                         guide = guide_colorbar(title = "Modal dominant wavelength (nm)", title.position = "top", title.hjust = 0, barwidth = 15, barheight = 0.4)) +
+    coord_sf(crs = dt_projection, expand = F, xlim = bounds[c(1, 3)], ylim = bounds[c(2, 4)]) +
+    labs(title = str_to_upper(month.name[month])) +
+    theme(legend.position = "bottom",
+          legend.direction = "horizontal",
+          panel.background = element_blank(),
+          panel.grid = element_blank(),
+          axis.text.y = element_blank(),
+          axis.title.y = element_blank(),
+          axis.title.x = element_blank(), 
+          axis.ticks.y = element_blank(),
+          axis.ticks.x = element_line(color = "grey"),
+          axis.text = element_text(color = "grey"), 
+          plot.title = element_text(hjust = 0.5))
+
+    monthlyColorMap %>% ggsave(filename = sprintf("figs/monthly_color_2bb54406aeffd6b652123878457838eb/%02d_lakeModalColor.png", month), width = 7, height = 4, dpi = "print")
+    print(paste0("file ", month, " finished."))
+}
+
+```
+
+
+### Monthly global (using raster rendered and exported from GEE)
+```{r}
+require(raster)
+require(rnaturalearthdata)
+
+colorGen = function() {
+    return(c('#610061', '#640066', '#67006A', '#6A006F', '#6D0073', '#6F0077', '#72007C', '#740080', '#760084', '#780088', '#79008D', '#7B0091', '#7C0095', '#7E0099', '#7F009D', '#8000A1', '#8100A5', '#8100A9', '#8200AD', '#8200B1', '#8300B5', '#8300B9', '#8300BC', '#8300C0', '#8200C4', '#8200C8', '#8100CC', '#8100CF', '#8000D3', '#7F00D7', '#7E00DB', '#7C00DE', '#7B00E2', '#7900E6', '#7800E9', '#7600ED', '#7400F1', '#7100F4', '#6F00F8', '#6D00FB', '#6A00FF', '#6600FF', '#6100FF', '#5D00FF', '#5900FF', '#5400FF', '#5000FF', '#4B00FF', '#4600FF', '#4200FF', '#3D00FF', '#3800FF', '#3300FF', '#2E00FF', '#2800FF', '#2300FF', '#1D00FF', '#1700FF', '#1100FF', '#0A00FF', '#0000FF', '#000BFF', '#0013FF', '#001BFF', '#0022FF', '#0028FF', '#002FFF', '#0035FF', '#003BFF', '#0041FF', '#0046FF', '#004CFF', '#0051FF', '#0057FF', '#005CFF', '#0061FF', '#0066FF', '#006CFF', '#0071FF', '#0076FF', '#007BFF', '#007FFF', '#0084FF', '#0089FF', '#008EFF', '#0092FF', '#0097FF', '#009CFF', '#00A0FF', '#00A5FF', '#00A9FF', '#00AEFF', '#00B2FF', '#00B7FF', '#00BBFF', '#00C0FF', '#00C4FF', '#00C8FF', '#00CDFF', '#00D1FF', '#00D5FF', '#00DAFF', '#00DEFF', '#00E2FF', '#00E6FF', '#00EAFF', '#00EFFF', '#00F3FF', '#00F7FF', '#00FBFF', '#00FFFF', '#00FFF5', '#00FFEA', '#00FFE0', '#00FFD5', '#00FFCB', '#00FFC0', '#00FFB5', '#00FFA9', '#00FF9E', '#00FF92', '#00FF87', '#00FF7B', '#00FF6E', '#00FF61', '#00FF54', '#00FF46', '#00FF38', '#00FF28', '#00FF17', '#00FF00', '#09FF00', '#0FFF00', '#15FF00', '#1AFF00', '#1FFF00', '#24FF00', '#28FF00', '#2DFF00', '#31FF00', '#36FF00', '#3AFF00', '#3EFF00', '#42FF00', '#46FF00', '#4AFF00', '#4EFF00', '#52FF00', '#56FF00', '#5AFF00', '#5EFF00', '#61FF00', '#65FF00', '#69FF00', '#6CFF00', '#70FF00', '#73FF00', '#77FF00', '#7BFF00', '#7EFF00', '#81FF00', '#85FF00', '#88FF00', '#8CFF00', '#8FFF00', '#92FF00', '#96FF00', '#99FF00', '#9CFF00', '#A0FF00', '#A3FF00', '#A6FF00', '#A9FF00', '#ADFF00', '#B0FF00', '#B3FF00', '#B6FF00', '#B9FF00', '#BDFF00', '#C0FF00', '#C3FF00', '#C6FF00', '#C9FF00', '#CCFF00', '#CFFF00', '#D2FF00', '#D5FF00', '#D8FF00', '#DBFF00', '#DEFF00', '#E1FF00', '#E4FF00', '#E7FF00', '#EAFF00', '#EDFF00', '#F0FF00', '#F3FF00', '#F6FF00', '#F9FF00', '#FCFF00', '#FFFF00', '#FFFC00', '#FFF900', '#FFF600', '#FFF200', '#FFEF00', '#FFEC00', '#FFE900', '#FFE600', '#FFE200', '#FFDF00', '#FFDC00', '#FFD900', '#FFD500', '#FFD200', '#FFCF00', '#FFCB00', '#FFC800', '#FFC500', '#FFC100', '#FFBE00', '#FFBB00', '#FFB700', '#FFB400', '#FFB000', '#FFAD00', '#FFA900', '#FFA600', '#FFA200', '#FF9F00', '#FF9B00', '#FF9800', '#FF9400', '#FF9100', '#FF8D00', '#FF8900', '#FF8600', '#FF8200', '#FF7E00', '#FF7B00', '#FF7700', '#FF7300', '#FF6F00', '#FF6B00', '#FF6700', '#FF6300', '#FF5F00', '#FF5B00', '#FF5700', '#FF5300', '#FF4F00', '#FF4B00', '#FF4600', '#FF4200', '#FF3E00', '#FF3900', '#FF3400', '#FF3000', '#FF2B00', '#FF2600', '#FF2100', '#FF1B00', '#FF1600', '#FF1000', '#FF0900', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000'))}
+colors = colorGen()
+dt_projection = "+proj=robin +lon_0=0 +datum=WGS84 +units=m +no_defs" 
+
+cl = rnaturalearthdata::countries50 %>% 
+  st_as_sf() %>% 
+  filter(continent != "Antarctica") %>% 
+  st_transform(dt_projection) %>% 
+  st_union()
+
+bounds = st_bbox(cl)
+
+
+imgs = dir(path = "~/Google_Drive_yxiao/monthly_lake_color_2bb54406aeffd6b652123878457838eb", full.names = T, pattern = "*.tif") %>%
+  tibble(filename = .)
+imgs = imgs %>% mutate(month = 1:nrow(imgs), monthname = str_to_upper(month.name))
+
+for (i in 1:nrow(imgs)) {
+  datImg = raster(x = imgs$filename[i])
+  datImgRp = projectRaster(datImg, crs = dt_projection) %>% 
+    mask(x = ., mask = as_Spatial(cl))
+  
+  datImgRp = as.data.frame(datImgRp, xy = TRUE) %>% as_tibble() %>% 
+    na.omit()
+  
+  names(datImgRp) = c("x", "y", "dw")
+
+  
+  monthlyColorMap = ggplot() +
+    geom_sf(data = cl, color = NA, fill = "black") +
+    geom_tile(data = datImgRp , aes(x = x, y = y, fill = dw)) +
+    scale_fill_gradientn(limits = c(380, 700), colours = colors, na.value='#FFFFFF00',
+                         guide = guide_colorbar(title = "Modal dominant wavelength (nm)", title.position = "top", title.hjust = 0, barwidth = 20, barheight = 0.6)) +
+    coord_sf(crs = dt_projection, expand = F, xlim = bounds[c(1, 3)], ylim = bounds[c(2, 4)]) +
+    labs(title = imgs$monthname[i]) +
+    theme(legend.position = "bottom",
+          legend.direction = "horizontal",
+          axis.text.y = element_blank(),
+          axis.title.y = element_blank(),
+          axis.title.x = element_blank(), 
+          axis.ticks.y = element_blank())
+  
+  monthlyColorMap %>% ggsave(filename = sprintf("figs/monthly_color_2bb54406aeffd6b652123878457838eb/%02d_lakeModalColor.png", imgs$month[i]), width = 7, height = 4, dpi = "print")
+  print(paste0("file ", i, " finished."))
+}
+
+```
+
+### Monthly CONUS
+
+```{r}
+require(raster)
+require(rnaturalearthdata)
+
+colorGen = function() {
+    return(c('#610061', '#640066', '#67006A', '#6A006F', '#6D0073', '#6F0077', '#72007C', '#740080', '#760084', '#780088', '#79008D', '#7B0091', '#7C0095', '#7E0099', '#7F009D', '#8000A1', '#8100A5', '#8100A9', '#8200AD', '#8200B1', '#8300B5', '#8300B9', '#8300BC', '#8300C0', '#8200C4', '#8200C8', '#8100CC', '#8100CF', '#8000D3', '#7F00D7', '#7E00DB', '#7C00DE', '#7B00E2', '#7900E6', '#7800E9', '#7600ED', '#7400F1', '#7100F4', '#6F00F8', '#6D00FB', '#6A00FF', '#6600FF', '#6100FF', '#5D00FF', '#5900FF', '#5400FF', '#5000FF', '#4B00FF', '#4600FF', '#4200FF', '#3D00FF', '#3800FF', '#3300FF', '#2E00FF', '#2800FF', '#2300FF', '#1D00FF', '#1700FF', '#1100FF', '#0A00FF', '#0000FF', '#000BFF', '#0013FF', '#001BFF', '#0022FF', '#0028FF', '#002FFF', '#0035FF', '#003BFF', '#0041FF', '#0046FF', '#004CFF', '#0051FF', '#0057FF', '#005CFF', '#0061FF', '#0066FF', '#006CFF', '#0071FF', '#0076FF', '#007BFF', '#007FFF', '#0084FF', '#0089FF', '#008EFF', '#0092FF', '#0097FF', '#009CFF', '#00A0FF', '#00A5FF', '#00A9FF', '#00AEFF', '#00B2FF', '#00B7FF', '#00BBFF', '#00C0FF', '#00C4FF', '#00C8FF', '#00CDFF', '#00D1FF', '#00D5FF', '#00DAFF', '#00DEFF', '#00E2FF', '#00E6FF', '#00EAFF', '#00EFFF', '#00F3FF', '#00F7FF', '#00FBFF', '#00FFFF', '#00FFF5', '#00FFEA', '#00FFE0', '#00FFD5', '#00FFCB', '#00FFC0', '#00FFB5', '#00FFA9', '#00FF9E', '#00FF92', '#00FF87', '#00FF7B', '#00FF6E', '#00FF61', '#00FF54', '#00FF46', '#00FF38', '#00FF28', '#00FF17', '#00FF00', '#09FF00', '#0FFF00', '#15FF00', '#1AFF00', '#1FFF00', '#24FF00', '#28FF00', '#2DFF00', '#31FF00', '#36FF00', '#3AFF00', '#3EFF00', '#42FF00', '#46FF00', '#4AFF00', '#4EFF00', '#52FF00', '#56FF00', '#5AFF00', '#5EFF00', '#61FF00', '#65FF00', '#69FF00', '#6CFF00', '#70FF00', '#73FF00', '#77FF00', '#7BFF00', '#7EFF00', '#81FF00', '#85FF00', '#88FF00', '#8CFF00', '#8FFF00', '#92FF00', '#96FF00', '#99FF00', '#9CFF00', '#A0FF00', '#A3FF00', '#A6FF00', '#A9FF00', '#ADFF00', '#B0FF00', '#B3FF00', '#B6FF00', '#B9FF00', '#BDFF00', '#C0FF00', '#C3FF00', '#C6FF00', '#C9FF00', '#CCFF00', '#CFFF00', '#D2FF00', '#D5FF00', '#D8FF00', '#DBFF00', '#DEFF00', '#E1FF00', '#E4FF00', '#E7FF00', '#EAFF00', '#EDFF00', '#F0FF00', '#F3FF00', '#F6FF00', '#F9FF00', '#FCFF00', '#FFFF00', '#FFFC00', '#FFF900', '#FFF600', '#FFF200', '#FFEF00', '#FFEC00', '#FFE900', '#FFE600', '#FFE200', '#FFDF00', '#FFDC00', '#FFD900', '#FFD500', '#FFD200', '#FFCF00', '#FFCB00', '#FFC800', '#FFC500', '#FFC100', '#FFBE00', '#FFBB00', '#FFB700', '#FFB400', '#FFB000', '#FFAD00', '#FFA900', '#FFA600', '#FFA200', '#FF9F00', '#FF9B00', '#FF9800', '#FF9400', '#FF9100', '#FF8D00', '#FF8900', '#FF8600', '#FF8200', '#FF7E00', '#FF7B00', '#FF7700', '#FF7300', '#FF6F00', '#FF6B00', '#FF6700', '#FF6300', '#FF5F00', '#FF5B00', '#FF5700', '#FF5300', '#FF4F00', '#FF4B00', '#FF4600', '#FF4200', '#FF3E00', '#FF3900', '#FF3400', '#FF3000', '#FF2B00', '#FF2600', '#FF2100', '#FF1B00', '#FF1600', '#FF1000', '#FF0900', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000', '#FF0000'))}
+colors = colorGen()
+dt_projection = "+proj=aea +lon_0=-112.1484375 +lat_1=20.4427494 +lat_2=60.9836903 +lat_0=40.7132199 +datum=WGS84 +units=m +no_defs" 
+
+cl = rnaturalearthdata::countries50 %>% 
+  st_as_sf() %>% 
+  filter(continent == "North America",
+         name != "Greenland"
+         ) %>% 
+  st_transform(dt_projection) %>% 
+  st_union()
+
+bounds = st_bbox(cl)
+
+monthlyColor = read_csv("outputs/monthlyColor_c2d77db60e960bbcd721fb580fa05896.csv", col_types = "cinnin")
+lakeData = st_read(dsn = "outputs/lake_samples_jida_05172020.shp")
+lakeData = lakeData %>% st_transform(crs = dt_projection)
+lakeData = lakeData %>% st_join(st_as_sf(st_as_sfc(bounds)), left = F)
+lakeData = lakeData %>% mutate(size = st_area(geometry))
+
+for (month in 1:12) {
+  
+  lakeDataThisMonth = lakeData %>% 
+    left_join(monthlyColor %>% filter(m == month, n >= 3), by = "id") %>% 
+    na.omit() %>% 
+    arrange(desc(size)) %>% 
+    dplyr::select(dwMedian)
+  
+  colorRaster = stars::st_rasterize(sf = lakeDataThisMonth, nx = 3000, ny = 2000, options = c("ALL_TOUCHED=TRUE", "MERGE_ALG=REPLACE"))
+  
+  colorRaster = colorRaster[cl, crop = F]
+  
+  monthlyColorMap = ggplot() +
+    geom_sf(data = cl, color = NA, fill = "black") +
+    geom_stars(data = colorRaster) +
+    scale_fill_gradientn(limits = c(450, 600), colours = colors[71:221], na.value='#FFFFFF00',
+                         guide = guide_colorbar(title = "Median dominant wavelength (nm)", title.position = "top", title.hjust = 0, barwidth = 15, barheight = 0.4)) +
+    coord_sf(crs = dt_projection, expand = F, xlim = bounds[c(1, 3)], ylim = bounds[c(2, 4)]) +
+    labs(title = str_to_upper(month.name[month])) +
+    theme(legend.position = "bottom",
+          legend.direction = "horizontal",
+          panel.background = element_blank(),
+          panel.grid = element_line(color = "lightgrey"),
+          axis.text.y = element_blank(),
+          axis.title.y = element_blank(),
+          axis.title.x = element_blank(), 
+          axis.ticks.y = element_blank(),
+          axis.ticks.x = element_line(color = "grey"),
+          axis.text = element_text(color = "grey"), 
+          plot.title = element_text(hjust = 0.5))
+
+    monthlyColorMap %>% ggsave(filename = sprintf("figs/monthly_color_NA_2bb54406aeffd6b652123878457838eb/%02d_lakeMedianColor.png", month), width = 8, height = 7, dpi = "print")
+    print(paste0("file ", month, " finished."))
+}
+```
+
+## Modal color inspection
+
+### Compare modal color with instantaneous color
+
+```{r}
+load("outputs/lake_color_per_img_c2d77db60e960bbcd721fb580fa05896.RData", verbose = T)
+
+dat0 = datFil %>% 
+  dplyr::select(id, dwLehmann) %>% 
+  na.omit() %>% 
+  group_by(id) %>% 
+  mutate(n = n()) %>% 
+  ungroup() %>% 
+  filter(n >= 20)
+
+p_ins = quantile(dat0$dwLehmann, probs = seq(0, 1, by = 0.01))
+p_mod = quantile(datMode$mode, probs = seq(0, 1, by = 0.01))
+
+tibble(p_ins, p_mod) %>% 
+  ggplot() +
+  geom_abline(aes(slope = 1, intercept = 0), color = "darkgrey") +
+  geom_point(aes(x = p_ins, y = p_mod))
+  
+ins_mod_comp = tibble(dw = dat0$dwLehmann, type = "Instantaneous color") %>% 
+  bind_rows(tibble(dw = datMode$mode, type = "Modal color")) %>% 
+  ggplot() +
+  # geom_density(aes(x = dw, color = type), show.legend = F) +
+  geom_density(aes(x = dw, fill = type), alpha = 0.3, color = "grey20", show.legend = T) +
+  labs(x = "Lake center color (dominant wavelength: nm)",
+       y = "Density", 
+       fill = "") +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.05))) +
+  theme_bw()
+
+ins_mod_comp
+
+ins_mod_comp %>% ggsave(filename = "figs/ins_mod_comp_c2d77db60e960bbcd721fb580fa05896.png",
+                        width = 6,
+                        height = 3, dpi = "print")
+```
+
+### Modal color (n>20) v.s. water occ groups
+
+```{r}
+load("outputs/datMode20_c2d77db60e960bbcd721fb580fa05896.RData", verbose = T)
+lakeClassBarplot = datMode %>% 
+  # filter(unimodal == "Unimodal") %>%
+  mutate(colorGrp = cut(mode, breaks = c(450, 530, 600), labels = c("Blue", "Yellow")),
+         occGrp = cut(lakeMeanOcc * 100, breaks = seq(0, 100, by = 10))) %>% 
+  ggplot() +
+  geom_boxplot(aes(x = occGrp, y = dwStd, fill = colorGrp)) +
+  stat_summary(aes(x = occGrp, y = dwStd, group = colorGrp), color = "black", fun.data = give.n, geom = "text", fun = median,
+                  position = position_dodge(width = 0.75)) +
+  scale_fill_manual(values = c("lightblue", "orange")) +
+  labs(
+    x = "Mean lake water occ (0-100)",
+    y = "sd(Dominant wavelength) nm",
+    fill = "Modal color group\n(h = 530 nm)"
+  ) +
+  facet_wrap(~unimodal, ncol = 1)
+
+lakeClassBarplot
+
+lakeClassBarplot %>% 
+  ggsave(filename = "figs/lakeClassBarplot_c2d77db60e960bbcd721fb580fa05896.png",
+         width = 8,
+         height = 8,
+         dpi = "print")
+```
+
+### DW distribution of unimodal colored lakes
+
+```{r}
+modal_dw_density = datMode %>% 
+  ggplot() +
+  geom_density(aes(mode), fill = "darkgrey") +
+  facet_wrap(~unimodal, ncol = 1) +
+  labs(x = "Modal DW (nm)", y = "Density")
+
+modal_dw_density
+
+modal_dw_density %>% 
+  ggsave(filename = "figs/modal_dw_density_c2d77db60e960bbcd721fb580fa05896.png",
+         width = 6,
+         height = 6)
+```
+
+### Visualize unimodal vs non-unimodal distributions
+```{r}
+set.seed(2020)
+datModeSample = datMode %>% 
+  group_by(unimodal) %>% 
+  sample_n(10) %>% 
+  mutate(index = 1:10) %>% 
+  ungroup()
+
+sampleDistributionUnimodal = datModeSample %>% 
+  select(id, unimodal, index) %>% 
+  left_join(dat0, by = "id") %>% 
+  ggplot() +
+  geom_histogram(aes(x = dwLehmann), binwidth = 2, color = "white", fill = "darkblue") +
+  facet_grid(index~unimodal, scales = "free_y") +
+  labs(x = "DW (nm)") +
+  theme(axis.title.y = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank())
+
+sampleDistributionUnimodal
+
+sampleDistributionUnimodal %>% 
+  ggsave(filename = "figs/sampleDistributionUnimodal_c2d77db60e960bbcd721fb580fa05896.png",
+         width = 7,
+         height = 6)
+```
+
+### Map lake unimodality and modal color
+```{r}
+require(sf)
+require(mapview)
+load("outputs/datMode20_c2d77db60e960bbcd721fb580fa05896.RData", verbose = T)
+
+# attach lon and lat for dp
+lakeSampleDp = st_read("outputs/lakeSample_Dp.geojson")
+lakeDpCoords = lakeSampleDp %>% filter(type == "dp") %>% mutate(dlon = st_coordinates(geometry)[, 1], dlat = st_coordinates(geometry)[, 2]) %>% st_drop_geometry() %>% select(id, dlon, dlat) %>% distinct() %>% as_tibble()
+
+datMap = datMode %>% 
+  select(nobs, mode, unimodal, id) %>% 
+  left_join(lakeDpCoords, by = "id")
+
+remove(lakeSampleDp, lakeDpCoords)
+
+datMap = datMap %>% 
+  st_as_sf(coords = c("dlon", "dlat"), crs = 4326)
+
+datMapSample = datMap %>% 
+  group_by(unimodal) %>% 
+  sample_n(2000) %>% 
+  ungroup() %>% 
+  mutate(color = cut(mode, breaks = c(470, 495, 560, 590), include.lowest = F))
+
+datMapSample %>% ggplot() + geom_bar(aes(x = color, fill = unimodal))
+
+m1 = mapview(datMapSample, zcol = "unimodal")
+m2 = mapview(datMapSample, zcol = "mode")
+
+m = m1 + m2
+
+m
+
+mapview(datMapSample, zcol = "color")
+```
+### Lakes with extreme colors
+
+```{r}
+extremeColor = datMap %>% 
+  filter(unimodal == "Unimodal") %>% 
+  mutate(colorGrp = cut(mode, breaks = c(450, 490, 585, 700), labels = c("Blue", "Middle", "Yellow"))) %>% 
+  filter(colorGrp != "Middle")
+
+
+mapview(extremeColor, zcol = "colorGrp")
+
+bluest = (extremeColor %>% arrange(mode))[1:20, ]
+
+bluest
+
+mapview(bluest)
+
+yellowest = (extremeColor %>% arrange(desc(mode)))[1:50, ]
+
+yellowest
+
+mapview(yellowest)
+```
+
+
+## Alternative methods of grouping lakes
+
+### K-means cluster
+
+```{r}
+datModeInput = datMode %>% 
+  # filter(unimodal == "Unimodal") %>% 
+  select(mode, dwStd)
+# %>% 
+#   scale
+
+cl = kmeans(x = datModeInput, centers = 3)
+
+datModeCl = datMode %>% 
+  mutate(clkmeans = cl$cluster)
+
+datModeCl %>% 
+  sample_n(30000) %>% 
+  ggplot() +
+  geom_point(aes(x = mode, y = dwStd, color = as.factor(clkmeans)), alpha = 0.3, size = 0.1)
+```
+
+
+### Cluster analysis
+
+https://uc-r.github.io/hc_clustering
+
+```{r}
+require(cluster)
+require(factoextra)
+
+load("outputs/datMode20_c2d77db60e960bbcd721fb580fa05896.RData", verbose = T)
+
+datModeInput = datMode[1:10000, ] %>% 
+  dplyr::select(mode, dwStd, lakeMeanOcc) %>% 
+  scale()
+
+hc4 = diana(datModeInput)
+```
+
+
