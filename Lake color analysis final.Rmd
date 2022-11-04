@@ -958,15 +958,15 @@ climate_depth_blue_lake_ratio = climte_variable_blue_ratios %>%
     scale_color_manual(values = grey(seq(0.1, 0.6, length = 2)) %>% rev(), guide = guide_legend(title.position = "top")) +
   facet_wrap(~precip_grp) +
   theme_bw() +
-  theme(axis.text.x.bottom = element_text(angle = 45, hjust = 0, vjust = 0),
+  theme(axis.text.x.bottom = element_text(angle = 0, hjust = 0, vjust = 0),
         legend.position = "bottom",
         legend.direction = "horizontal")
 
 climate_depth_blue_lake_ratio
 
-climate_depth_blue_lake_ratio %>% ggsave(filename = "figs/Figure3_summer_climate_depth_blue_lake_ratio_temp2bin.png", width = 6.5, height = 3.5)
+climate_depth_blue_lake_ratio %>% ggsave(filename = "figs/Figure3_summer_climate_depth_blue_lake_ratio_temp2bin_813.png", width = 6.5, height = 3.5)
 
-climate_depth_blue_lake_ratio %>% ggsave(filename = "figs/Figure3_summer_climate_depth_blue_lake_ratio_temp2bin.pdf", width = 6.5, height = 3.5)
+climate_depth_blue_lake_ratio %>% ggsave(filename = "figs/Figure3_summer_climate_depth_blue_lake_ratio_temp2bin_813.pdf", width = 6.5, height = 3.5)
 ```
 
 
